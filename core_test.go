@@ -567,6 +567,18 @@ func TestDashboardSettingsRejectInvalidOrUnintentionalWrite(t *testing.T) {
 	}
 }
 
+func TestDashboardBackgroundRefreshPreservesSettingsForm(t *testing.T) {
+	if !strings.Contains(dashboardHTML, "function render(preserveSettingsForm=false)") {
+		t.Fatal("dashboard render function has no settings-form preservation mode")
+	}
+	if !strings.Contains(dashboardHTML, "if(preserveSettingsForm&&$('settingsForm'))return") {
+		t.Fatal("background refresh can still rebuild an active settings form")
+	}
+	if !strings.Contains(dashboardHTML, "render(active==='settings')") {
+		t.Fatal("monitor refresh does not request settings-form preservation")
+	}
+}
+
 func TestLedgerNewestFirstAndLimited(t *testing.T) {
 	dir := t.TempDir()
 	for i := 1; i <= 3; i++ {
