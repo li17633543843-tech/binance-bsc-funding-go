@@ -1,0 +1,23 @@
+[Unit]
+Description=Binance BSC funding arbitrage bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fundingbot
+Group=fundingbot
+WorkingDirectory=/opt/binance-bsc-funding
+EnvironmentFile=/etc/binance-bsc-funding.env
+ExecStart=/opt/binance-bsc-funding/binance-bsc-funding -config /etc/binance-bsc-funding.json
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/binance-bsc-funding
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

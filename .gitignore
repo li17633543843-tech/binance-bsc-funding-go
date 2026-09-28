@@ -1,0 +1,14 @@
+config.json
+*.env
+data/
+.tools/
+.cache/
+*.exe
+*.exe~
+*.tar.gz
+binance-bsc-funding
+binance-bsc-funding.exe
+binance-bsc-funding-linux-*
+binance-bsc-funding-server-*/
+bot-test.exe
+funding-tests.exe

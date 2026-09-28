@@ -1,0 +1,131 @@
+{
+  "mode": "monitor",
+  "scan_seconds": 60,
+  "state_dir": "./data",
+  "health_listen": "127.0.0.1:8788",
+  "binance": {
+    "base_url": "https://fapi.binance.com",
+    "api_key_env": "FUNDING_BOT_BINANCE_API_KEY",
+    "secret_key_env": "FUNDING_BOT_BINANCE_SECRET",
+    "taker_fee_bps": 5.0,
+    "leverage": 1,
+    "margin_type": "CROSSED",
+    "recv_window_ms": 5000,
+    "request_timeout_seconds": 15
+  },
+  "bsc": {
+    "rpc_url": "https://bsc-dataseed.bnbchain.org",
+    "chain_id": 56,
+    "wallet_address": "0x0000000000000000000000000000000000000000",
+    "private_key_env": "FUNDING_BOT_BSC_PRIVATE_KEY",
+    "usdt_address": "0x55d398326f99059fF775485246999027B3197955",
+    "usdt_decimals": 18,
+    "slippage_bps": 30,
+    "gas_reserve_usdt_per_round_trip": 0.20,
+    "max_gas_limit": 3000000,
+    "max_gas_price_gwei": 10,
+    "confirmations": 2
+  },
+  "okx_dex": {
+    "base_url": "https://web3.okx.com",
+    "api_key_env": "FUNDING_BOT_OKX_API_KEY",
+    "secret_key_env": "FUNDING_BOT_OKX_SECRET_KEY",
+    "passphrase_env": "FUNDING_BOT_OKX_PASSPHRASE",
+    "project_id_env": "FUNDING_BOT_OKX_PROJECT_ID",
+    "request_timeout_seconds": 15,
+    "disable_rfq": true
+  },
+  "auto_discovery": {
+    "enabled": true,
+    "refresh_minutes": 360,
+    "deny_symbols": ["USDT", "USDC", "FDUSD"]
+  },
+  "dashboard": {
+    "refresh_seconds": 10,
+    "allow_lan": false,
+    "username": "monitor",
+    "password_env": "FUNDING_BOT_DASHBOARD_PASSWORD"
+  },
+  "strategy": {
+    "target_positions": 25,
+    "max_quote_candidates": 40,
+    "chain_quote_refresh_minutes": 30,
+    "min_current_funding_bps_per_interval": 5.0,
+    "min_funding_apr_percent": 20.0,
+    "funding_intervals_per_year": 1095,
+    "funding_ewma_alpha": 0.15,
+	"funding_history_days": 30,
+	"min_funding_history_samples": 12,
+	"min_positive_funding_ratio": 0.70,
+	"max_current_to_median_ratio": 3.0,
+	"entry_confirmation_scans": 2,
+	"weak_funding_settlements": 3,
+	"min_cost_coverage_ratio": 2.5,
+    "evaluation_hold_hours": 720,
+	"max_entry_payback_days": 10,
+    "min_switch_apr_advantage_percent": 12.0,
+    "min_switch_profit_usdt": 3.0,
+    "min_position_age_hours_before_switch": 72,
+    "price_spread_take_profit_bps": 80,
+    "min_price_arb_net_usdt": 2.0,
+    "price_arb_cooldown_hours": 24
+  },
+  "risk": {
+    "total_capital_usdt": 10000,
+    "target_notional_per_coin_usdt": 300,
+    "max_notional_per_coin_usdt": 500,
+    "max_capital_per_coin_percent": 5,
+    "depth_safety_multiplier": 3,
+    "depth_reduction_trigger_percent": 10,
+    "min_depth_reduction_percent": 5,
+    "depth_emergency_shortfall_percent": 50,
+    "depth_breach_confirmations": 3,
+    "depth_close_cooldown_hours": 24,
+    "max_chain_price_impact_bps": 35,
+    "reference_quote_usdt": 10,
+    "min_liquidation_distance_x": 3.0,
+    "emergency_liquidation_distance_x": 1.5,
+    "slow_reduce_percent": 10,
+    "liquidation_breach_confirmations": 3,
+    "risk_reduce_cooldown_minutes": 15,
+    "account_margin_stop_entry_percent": 55,
+    "account_margin_reduce_percent": 65,
+    "account_margin_high_percent": 75,
+    "account_margin_emergency_percent": 80,
+    "account_high_reduce_percent": 25,
+    "account_emergency_reduce_percent": 50,
+    "max_hedge_drift_percent": 3,
+    "max_data_age_seconds": 120,
+    "max_consecutive_failures": 3,
+    "max_daily_loss_usdt": 100
+  },
+  "alerts": {
+    "webhook_url_env": "FUNDING_BOT_WEBHOOK_URL",
+    "telegram_token_env": "FUNDING_BOT_TELEGRAM_TOKEN",
+    "telegram_chat_id_env": "FUNDING_BOT_TELEGRAM_CHAT_ID",
+    "cooldown_seconds": 300
+  },
+  "tokens": [
+    {
+      "enabled": true,
+      "symbol": "CAKE",
+      "binance_symbol": "CAKEUSDT",
+      "bsc_address": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82",
+      "decimals": 18,
+      "max_notional_usdt": 500,
+      "verified_contract": true,
+      "fee_on_transfer": false
+    },
+    {
+      "enabled": true,
+      "symbol": "BNB",
+      "binance_symbol": "BNBUSDT",
+      "bsc_address": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+      "decimals": 18,
+      "max_notional_usdt": 500,
+      "verified_contract": true,
+      "fee_on_transfer": false
+    }
+  ],
+  "live_unlock": ""
+}
