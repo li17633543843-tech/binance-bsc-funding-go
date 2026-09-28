@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>资金费监控台</title>
+  <style>
+    :root{--bg:#080b11;--panel:#111722;--panel2:#171f2c;--line:#253044;--text:#f4f7fb;--muted:#8f9bb0;--green:#45e39a;--lime:#b8f35b;--red:#ff6b7a;--amber:#ffca63;--blue:#69a7ff;--r:18px}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% -10%,#183155 0,transparent 35%),var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC",sans-serif;min-height:100vh}
+    .shell{max-width:1280px;margin:auto;padding:28px 22px 48px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:24px}.eyebrow{color:var(--lime);font-weight:750;letter-spacing:.12em;text-transform:uppercase;font-size:11px}.title{font-size:clamp(25px,5vw,42px);line-height:1.1;margin:5px 0 7px}.sub{color:var(--muted)}.status{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#101722;border:1px solid var(--line);border-radius:999px;white-space:nowrap}.dot{width:9px;height:9px;border-radius:50%;background:var(--amber);box-shadow:0 0 14px currentColor}.dot.ok{background:var(--green)}.dot.bad{background:var(--red)}
+    .error{display:none;background:#36171e;border:1px solid #71303c;color:#ffc4cb;padding:12px 15px;border-radius:12px;margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:22px}.card{background:linear-gradient(155deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:var(--r);padding:16px;min-height:104px}.label{color:var(--muted);font-size:12px}.value{font-size:25px;font-weight:780;margin-top:10px;letter-spacing:-.03em}.unit{font-size:12px;color:var(--muted);margin-left:4px}
+    .panel{background:rgba(15,20,30,.92);border:1px solid var(--line);border-radius:22px;overflow:hidden;box-shadow:0 22px 80px rgba(0,0,0,.22)}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px;border-bottom:1px solid var(--line)}.tabs{display:flex;gap:6px;overflow:auto}.tab{border:0;color:var(--muted);background:transparent;padding:10px 13px;border-radius:11px;font-weight:650;cursor:pointer;white-space:nowrap}.tab.active{background:#263247;color:#fff}.search{width:230px;max-width:42vw;background:#0a0f17;border:1px solid var(--line);color:#fff;border-radius:11px;padding:10px 12px;outline:none}.search:focus{border-color:var(--blue)}
+    .tablewrap{overflow:auto;min-height:380px}table{width:100%;border-collapse:collapse;min-width:790px}th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:650;padding:13px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#101620}td{padding:14px 16px;border-bottom:1px solid rgba(37,48,68,.65)}tr:hover td{background:#151d29}.sym{font-weight:760}.small{color:var(--muted);font-size:12px}.pos{color:var(--green);font-variant-numeric:tabular-nums}.neg{color:var(--red)}.warn{color:var(--amber)}.num{font-variant-numeric:tabular-nums}.badge{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#253043;color:#aeb9cb}.badge.yes{color:#7df0b6;background:#123429}.badge.no{color:#a4afc1}.badge.warn{color:#ffd88b;background:#382d16}.empty{text-align:center;padding:78px 20px;color:var(--muted)}.foot{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px;padding:12px 16px;background:#0c1119}.spin{display:inline-block;width:12px;height:12px;border:2px solid #40506a;border-top-color:var(--lime);border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}
+    .settings{padding:18px;max-width:1120px;margin:auto}.settingsIntro{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;background:#111a27;border:1px solid var(--line);padding:16px;border-radius:15px;margin-bottom:16px}.settingsIntro h2{margin:0 0 5px;font-size:19px}.notice{padding:11px 13px;border-radius:11px;background:#17243a;color:#b9d3ff;margin:0 0 14px}.notice.good{background:#123429;color:#8ff2bf}.notice.bad{background:#36171e;color:#ffc4cb}.settingSection{margin:16px 0 20px}.settingSection h3{font-size:15px;margin:0 0 10px}.settingGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.settingField{display:flex;flex-direction:column;gap:6px;background:#0c121c;border:1px solid var(--line);border-radius:13px;padding:12px}.settingField label{font-weight:650}.settingField input{width:100%;background:#080d14;border:1px solid #303c52;color:#fff;border-radius:9px;padding:10px 11px;font:inherit;outline:none}.settingField input:focus{border-color:var(--blue)}.settingHint{font-size:11px;color:var(--muted);min-height:32px}.settingActions{position:sticky;bottom:0;display:flex;justify-content:flex-end;gap:10px;padding:13px;background:rgba(12,17,25,.96);border:1px solid var(--line);border-radius:14px}.btn{border:1px solid var(--line);background:#202b3d;color:#fff;border-radius:10px;padding:10px 15px;font-weight:700;cursor:pointer}.btn.primary{background:var(--lime);border-color:var(--lime);color:#10150a}.btn:disabled{opacity:.5;cursor:not-allowed}.applyTag{font-size:10px;padding:3px 6px;border-radius:999px;background:#183625;color:#83eeb8;margin-left:6px}.applyTag.restart{background:#3b2c13;color:#ffd37a}
+    @media(max-width:960px){.cards{grid-template-columns:repeat(3,1fr)}.settingGrid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:620px){.shell{padding:20px 12px 34px}.top{align-items:stretch;flex-direction:column}.status{align-self:flex-start}.cards{grid-template-columns:repeat(2,1fr);gap:9px}.card{min-height:91px;padding:13px}.value{font-size:22px}.toolbar{align-items:stretch;flex-direction:column}.search{width:100%;max-width:none}.foot{flex-direction:column}.panel{border-radius:17px}.settings{padding:11px}.settingsIntro{flex-direction:column}.settingGrid{grid-template-columns:1fr}.settingActions{justify-content:stretch}.settingActions .btn{flex:1}}
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="top">
+    <div><div class="eyebrow">Binance × OKX DEX</div><h1 class="title">资金费套利监控台</h1><div class="sub">BSC 现货深度、正资金费率与候选机会实时汇总</div></div>
+    <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">正在连接</span></div>
+  </header>
+  <div id="error" class="error"></div>
+  <section class="cards">
+    <div class="card"><div class="label">运行模式</div><div id="mode" class="value">—</div></div>
+    <div class="card"><div class="label">正费率合约</div><div id="positive" class="value">—</div></div>
+    <div class="card"><div class="label">BSC 已匹配</div><div id="matched" class="value">—</div></div>
+    <div class="card"><div class="label">套利候选</div><div id="opportunityCount" class="value">—</div></div>
+    <div class="card"><div class="label">当前持仓</div><div id="positionCount" class="value">—</div></div>
+    <div class="card"><div class="label">合约保证金率</div><div id="marginRatio" class="value">—</div></div>
+    <div class="card"><div class="label">合约可用保证金</div><div id="availableMargin" class="value">—</div></div>
+    <div class="card"><div class="label">今日已实现</div><div id="dailyPnl" class="value">—</div></div>
+  </section>
+  <section class="panel">
+    <div class="toolbar"><div class="tabs"><button class="tab active" data-tab="funding">正费率</button><button class="tab" data-tab="opportunities">套利候选</button><button class="tab" data-tab="positions">持仓</button><button class="tab" data-tab="ledger">模拟订单</button><button class="tab" data-tab="settings">参数设置</button></div><input id="search" class="search" placeholder="搜索币种…" autocomplete="off"></div>
+    <div class="tablewrap"><div id="content" class="empty"><span class="spin"></span> 正在加载数据</div></div>
+    <footer class="foot"><span id="lastUpdate">尚未更新</span><span>每 __REFRESH_SECONDS__ 秒自动刷新 · 参数修改会写入独立覆盖文件</span></footer>
+  </section>
+</main>
+<script>
+  const REFRESH_SECONDS=__REFRESH_SECONDS__;let active='funding';let snapshot={health:{},funding:[],opportunities:[],positions:{},ledger:[]};let settingsState=null,settingsMessage='';
+  const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+  const n=(v,d=2)=>Number.isFinite(Number(v))?Number(v).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d}):'—';
+  const time=v=>{if(!v)return'—';const d=new Date(v);return Number.isNaN(d.getTime())?'—':d.toLocaleString('zh-CN',{hour12:false})};
+  function setStatus(ok,text){$('statusDot').className='dot '+(ok?'ok':'bad');$('statusText').textContent=text}
+  function matchLabel(x){if(x.bsc_spot_matched)return'已匹配';const labels={ambiguous_exact_symbol:'同名歧义',no_exact_market_match:'无可信市场匹配',search_error:'搜索失败',address_already_used:'地址已占用',invalid_decimals:'精度异常'};return labels[x.bsc_match_status]||'未匹配'}
+  const settingGroups=[
+    {title:'常用开仓参数',runtime:true,fields:[
+      {p:'strategy.min_current_funding_bps_per_interval',l:'最低当前费率',u:'bps/期',s:'0.1',h:'例如 5 表示当前费率至少 5 bps'},
+      {p:'strategy.min_funding_apr_percent',l:'最低保守年化',u:'%',s:'0.5',h:'历史模型计算的最低年化门槛'},
+      {p:'strategy.target_positions',l:'目标持仓币数',u:'个',s:'1',h:'允许 1–50 个'},
+      {p:'strategy.max_quote_candidates',l:'最多深度报价候选',u:'个',s:'1',h:'不能低于目标持仓币数'},
+      {p:'strategy.chain_quote_refresh_minutes',l:'链上报价刷新',u:'分钟',s:'5',h:'至少 5 分钟，降低OKX限流'},
+      {p:'risk.target_notional_per_coin_usdt',l:'每币目标仓位',u:'USDT',s:'10',h:'现货和空单各自的名义金额'},
+      {p:'risk.total_capital_usdt',l:'策略资金上限',u:'USDT',s:'100',h:'必须覆盖目标币数 × 每币仓位'},
+      {p:'risk.max_notional_per_coin_usdt',l:'单币最大仓位',u:'USDT',s:'10',h:'不能低于每币目标仓位'},
+      {p:'risk.max_capital_per_coin_percent',l:'单币资金上限',u:'%',s:'0.5',h:'按策略资金上限计算'},
+      {p:'strategy.entry_confirmation_scans',l:'开仓确认次数',u:'次',s:'1',h:'连续满足条件后才开仓'}]},
+    {title:'历史费率与收益质量',runtime:true,fields:[
+      {p:'strategy.funding_history_days',l:'历史窗口',u:'天',s:'1',h:'允许 30–90 天'},
+      {p:'strategy.min_funding_history_samples',l:'最低历史样本',u:'条',s:'1',h:'样本不足不进入候选'},
+      {p:'strategy.min_positive_funding_ratio',l:'正费率最低占比',u:'0–1',s:'0.01',h:'0.70 表示至少 70%'},
+      {p:'strategy.max_current_to_median_ratio',l:'当前/中位数上限',u:'倍',s:'0.1',h:'过滤突然冲高的短暂费率'},
+      {p:'strategy.funding_ewma_alpha',l:'费率EWMA权重',u:'0–1',s:'0.01',h:'越大越重视近期费率'},
+      {p:'strategy.funding_intervals_per_year',l:'默认年结算次数',u:'次',s:'1',h:'交易所未返回周期时使用'},
+      {p:'strategy.weak_funding_settlements',l:'弱费率结算确认',u:'次',s:'1',h:'连续弱结算后允许换仓'},
+      {p:'strategy.min_cost_coverage_ratio',l:'收益覆盖成本倍数',u:'倍',s:'0.1',h:'预计收益至少覆盖成本多少倍'},
+      {p:'strategy.evaluation_hold_hours',l:'收益评估持有期',u:'小时',s:'24',h:'用于评估成本和预期收益'},
+      {p:'strategy.max_entry_payback_days',l:'最长回本时间',u:'天',s:'0.5',h:'超过则不进入候选'}]},
+    {title:'换仓与价差退出',runtime:true,fields:[
+      {p:'strategy.min_switch_apr_advantage_percent',l:'换仓年化优势',u:'%',s:'0.5',h:'新币至少高出当前仓位多少'},
+      {p:'strategy.min_switch_profit_usdt',l:'换仓最低额外收益',u:'USDT',s:'0.5',h:'覆盖换仓磨损后的最低收益'},
+      {p:'strategy.min_position_age_hours_before_switch',l:'换仓前最短持仓',u:'小时',s:'1',h:'防止费率波动导致频繁换仓'},
+      {p:'strategy.price_spread_take_profit_bps',l:'价差止盈门槛',u:'bps',s:'5',h:'净价差收益达到后平仓'},
+      {p:'strategy.min_price_arb_net_usdt',l:'价差最低净利润',u:'USDT',s:'0.5',h:'同时满足金额门槛才退出'},
+      {p:'strategy.price_arb_cooldown_hours',l:'价差退出冷却',u:'小时',s:'1',h:'退出后暂不重复进入'}]},
+    {title:'链上深度风控',runtime:true,fields:[
+      {p:'risk.depth_safety_multiplier',l:'深度安全倍数',u:'倍',s:'0.1',h:'链上可退出深度需覆盖仓位'},
+      {p:'risk.depth_reduction_trigger_percent',l:'深度减仓触发缺口',u:'%',s:'1',h:'轻微瞬时不足不会立刻减仓'},
+      {p:'risk.min_depth_reduction_percent',l:'最小减仓比例',u:'%',s:'1',h:'避免极小频繁减仓'},
+      {p:'risk.depth_emergency_shortfall_percent',l:'深度紧急缺口',u:'%',s:'1',h:'达到后执行紧急处理'},
+      {p:'risk.depth_breach_confirmations',l:'深度异常确认',u:'次',s:'1',h:'连续确认后减仓'},
+      {p:'risk.depth_close_cooldown_hours',l:'深度退出冷却',u:'小时',s:'1',h:'退出后禁止立即重开'},
+      {p:'risk.max_chain_price_impact_bps',l:'最大链上冲击',u:'bps',s:'1',h:'超过则拒绝开仓'},
+      {p:'risk.reference_quote_usdt',l:'深度参考报价',u:'USDT',s:'1',h:'用于估算小额参考价格'},
+      {p:'risk.max_hedge_drift_percent',l:'最大对冲偏差',u:'%',s:'0.1',h:'超过后修正两边数量'}]},
+    {title:'全仓账户风控',runtime:true,fields:[
+      {p:'risk.min_liquidation_distance_x',l:'普通减仓爆仓距离',u:'倍',s:'0.1',h:'低于该距离开始分批减仓'},
+      {p:'risk.emergency_liquidation_distance_x',l:'紧急爆仓距离',u:'倍',s:'0.1',h:'低于该距离立即退出单币'},
+      {p:'risk.slow_reduce_percent',l:'普通单次减仓',u:'%',s:'1',h:'每次只减固定比例'},
+      {p:'risk.liquidation_breach_confirmations',l:'爆仓距离确认',u:'次',s:'1',h:'普通风险需连续确认'},
+      {p:'risk.risk_reduce_cooldown_minutes',l:'组合减仓冷却',u:'分钟',s:'1',h:'避免同一时间集中平仓'},
+      {p:'risk.account_margin_stop_entry_percent',l:'暂停开仓保证金率',u:'%',s:'1',h:'达到后停止开仓和换仓'},
+      {p:'risk.account_margin_reduce_percent',l:'普通减仓保证金率',u:'%',s:'1',h:'达到后开始降低组合风险'},
+      {p:'risk.account_margin_high_percent',l:'高风险保证金率',u:'%',s:'1',h:'提高单次减仓比例'},
+      {p:'risk.account_margin_emergency_percent',l:'紧急保证金率',u:'%',s:'1',h:'紧急降低仓位'},
+      {p:'risk.account_high_reduce_percent',l:'高风险单次减仓',u:'%',s:'1',h:'高风险档处理比例'},
+      {p:'risk.account_emergency_reduce_percent',l:'紧急单次减仓',u:'%',s:'1',h:'紧急档处理比例'},
+      {p:'risk.max_daily_loss_usdt',l:'每日最大亏损',u:'USDT',s:'5',h:'达到后停止新增仓位'},
+      {p:'risk.max_data_age_seconds',l:'行情最长延迟',u:'秒',s:'5',h:'行情过期则不操作'},
+      {p:'risk.max_consecutive_failures',l:'最大连续失败',u:'次',s:'1',h:'达到后发送故障报警'}]},
+    {title:'需要重启的运行参数',restart:true,fields:[
+      {p:'scan_seconds',l:'扫描间隔',u:'秒',s:'1',h:'保存后重启程序生效'},
+      {p:'leverage',l:'币安杠杆上限',u:'倍',s:'1',h:'保存后重启；不会自动改旧仓位'},
+      {p:'taker_fee_bps',l:'合约吃单费率',u:'bps',s:'0.1',h:'用于收益和成本计算'},
+      {p:'slippage_bps',l:'链上允许滑点',u:'bps',s:'1',h:'实盘交易保护参数'},
+      {p:'gas_reserve_usdt_per_round_trip',l:'往返Gas预留',u:'USDT',s:'0.05',h:'用于净收益评估'},
+      {p:'max_gas_price_gwei',l:'最高Gas价格',u:'Gwei',s:'0.5',h:'超过时拒绝链上交易'},
+      {p:'discovery_refresh_minutes',l:'代币发现刷新',u:'分钟',s:'5',h:'保存后重启生效'},
+      {p:'dashboard_refresh_seconds',l:'页面刷新间隔',u:'秒',s:'1',h:'保存后刷新进程生效'}]}
+  ];
+  const getPath=(o,p)=>p.split('.').reduce((v,k)=>v?.[k],o);const setPath=(o,p,v)=>{const ks=p.split('.');let x=o;ks.slice(0,-1).forEach(k=>x=x[k]);x[ks[ks.length-1]]=v};
+  function rowsFunding(){const q=$('search').value.trim().toUpperCase();const data=snapshot.funding.filter(x=>!q||x.symbol.includes(q)||x.base_asset.includes(q));if(!data.length)return empty('没有符合条件的正费率合约');return `<table><thead><tr><th>合约</th><th>本期费率</th><th>简单年化</th><th>标记价格</th><th>下次结算</th><th>BSC现货</th><th>链上报价</th></tr></thead><tbody>${data.map(x=>`<tr><td><div class="sym">${esc(x.symbol)}</div><div class="small">${esc(x.base_asset)}</div></td><td class="pos num">+${n(x.funding_bps_per_interval,4)} bps</td><td class="pos num">${n(x.simple_apr_percent)}%</td><td class="num">${n(x.mark_price,6)}</td><td>${time(x.next_funding_time)}</td><td><span class="badge ${x.bsc_spot_matched?'yes':'no'}">${matchLabel(x)}</span></td><td><span class="badge ${x.eligible_for_okx_quotes?'yes':'no'}">${x.eligible_for_okx_quotes?'可报价':'跳过'}</span></td></tr>`).join('')}</tbody></table>`}
+  function rowsOpportunities(){const q=$('search').value.trim().toUpperCase();const data=snapshot.opportunities.filter(x=>!q||x.symbol.includes(q));if(!data.length)return empty('当前没有通过历史费率、成本与深度筛选的套利候选');return `<table><thead><tr><th>合约</th><th>保守净年化</th><th>30日中位</th><th>正费率占比</th><th>本期费率</th><th>建议仓位</th><th>回本天数</th><th>往返成本</th><th>路由</th></tr></thead><tbody>${data.map(x=>`<tr><td><div class="sym">${esc(x.symbol)}</div><div class="small">样本 ${x.funding_history_samples||0}</div></td><td class="pos num">${n(x.net_apr_percent)}%</td><td class="num">${n(x.median_30d_apr_percent)}%</td><td class="num">${n(Number(x.positive_funding_ratio)*100,1)}%</td><td class="pos num">+${n(x.funding_bps_per_interval,4)} bps</td><td class="num">$${n(x.target_notional_usdt)}</td><td class="num">${n(x.payback_days,1)}</td><td class="num">$${n(x.round_trip_cost_usdt,3)}</td><td><div>${esc((x.chain?.dexes||[]).join(', ')||'—')}</div><div class="small">冲击 ${n(x.chain?.depth_impact_bps,3)} bps</div></td></tr>`).join('')}</tbody></table>`}
+  function rowsPositions(){const q=$('search').value.trim().toUpperCase();const data=Object.values(snapshot.positions||{}).filter(x=>!q||x.symbol.includes(q));if(!data.length)return empty('当前没有模拟或实盘持仓');return `<table><thead><tr><th>合约</th><th>名义仓位</th><th>累计资金费</th><th>保守年化</th><th>30日中位</th><th>正费率占比</th><th>弱结算次数</th><th>对冲偏差</th><th>爆仓距离</th></tr></thead><tbody>${data.map(x=>`<tr><td class="sym">${esc(x.symbol)}</td><td class="num">$${n(x.notional_usdt)}</td><td class="${x.funding_accrued_usdt>=0?'pos':'neg'} num">$${n(x.funding_accrued_usdt,4)}</td><td class="num">${n(x.funding_apr_percent)}%</td><td class="num">${n(x.median_30d_apr_percent)}%</td><td class="num">${n(Number(x.positive_funding_ratio)*100,1)}%</td><td class="num">${x.weak_funding_settlements||0}/3</td><td class="num">${n(x.hedge_drift_percent)}%</td><td class="num">${x.liquidation_distance_x?n(x.liquidation_distance_x,2)+'×':'—'}</td></tr>`).join('')}</tbody></table>`}
+  function rowsLedger(){const q=$('search').value.trim().toUpperCase();const labels={open:'开仓',close:'平仓',reduce:'减仓',hedge_correction:'对冲修正',config_update:'参数修改'};const data=(snapshot.ledger||[]).filter(x=>!q||String(x.symbol||'').toUpperCase().includes(q)||String(x.event||'').toUpperCase().includes(q));if(!data.length)return empty('模拟订单产生后会显示在这里');return `<table><thead><tr><th>时间</th><th>事件</th><th>合约</th><th>模式</th><th>原因</th><th>金额 / 结果</th></tr></thead><tbody>${data.map(x=>{const detail=x.event==='open'?`$${n(x.notional_usdt)} · APR ${n(x.funding_apr_percent)}%`:x.event==='close'?`PnL $${n(x.pnl_usdt,4)} · 资金费 $${n(x.funding_usdt,4)}`:x.event==='reduce'?`减仓 ${n(Number(x.fraction)*100,1)}% · PnL $${n(x.pnl_usdt,4)} · 资金费 $${n(x.funding_usdt,4)}`:x.event==='config_update'?`${esc((x.changed_sections||[]).join('、'))}${x.restart_required?' · 需要重启':''}`:`现货 ${n(x.token_qty,6)} / 空单 ${n(x.short_qty,6)}`;return `<tr><td>${time(x.time)}</td><td><span class="badge ${(x.event==='close'||x.event==='reduce')?(Number(x.pnl_usdt)>=0?'yes':'warn'):x.event==='open'||x.event==='config_update'?'yes':''}">${esc(labels[x.event]||x.event||'事件')}</span></td><td class="sym">${esc(x.symbol||'—')}</td><td>${esc(x.mode||'—')}</td><td>${esc(x.reason||'—')}</td><td class="num">${detail}</td></tr>`}).join('')}</tbody></table>`}
+  function renderSettings(){if(!settingsState)return settingsMessage?`<div class="empty neg">${esc(settingsMessage)}</div>`:`<div class="empty"><span class="spin"></span> 正在读取参数</div>`;const s=settingsState.settings;const groups=settingGroups.map(g=>`<section class="settingSection"><h3>${esc(g.title)}<span class="applyTag ${g.restart?'restart':''}">${g.restart?'重启后生效':'下一轮生效'}</span></h3><div class="settingGrid">${g.fields.map(f=>`<div class="settingField"><label>${esc(f.l)} <span class="small">${esc(f.u)}</span></label><input type="number" inputmode="decimal" step="${esc(f.s)}" data-setting="${esc(f.p)}" value="${esc(getPath(s,f.p))}"><div class="settingHint">${esc(f.h)}</div></div>`).join('')}</div></section>`).join('');return `<div class="settings"><div class="settingsIntro"><div><h2>策略参数设置</h2><div class="small">当前模式：${esc(settingsState.mode).toUpperCase()}。密钥、钱包地址、实盘开关和代币合约不会在页面展示。</div></div><span class="badge ${settingsState.mode==='live'?'warn':'yes'}">${settingsState.mode==='live'?'实盘修改请谨慎':'模拟调试'}</span></div>${settingsMessage?`<div class="notice ${settingsMessage.startsWith('失败')?'bad':'good'}">${esc(settingsMessage)}</div>`:''}<form id="settingsForm">${groups}<div class="settingActions"><button class="btn" type="button" id="reloadSettings">放弃修改</button><button class="btn primary" type="submit" id="saveSettings">确认并保存</button></div></form></div>`}
+  function bindSettings(){const form=$('settingsForm');if(!form)return;$('reloadSettings').onclick=()=>loadSettings(true);form.onsubmit=saveSettings}
+  async function loadSettings(force=false){if(settingsState&&!force){render();return}settingsMessage='';try{const r=await fetch('/v1/settings',{cache:'no-store'});if(!r.ok)throw new Error(await r.text());settingsState=await r.json()}catch(err){settingsMessage='失败：'+err.message}render()}
+  async function saveSettings(ev){ev.preventDefault();const next=JSON.parse(JSON.stringify(settingsState.settings));for(const input of document.querySelectorAll('[data-setting]')){const value=input.valueAsNumber;if(!Number.isFinite(value)){settingsMessage='失败：请检查空白或无效数字';render();return}setPath(next,input.dataset.setting,value)}if(!confirm(`确认保存这些参数？\n\n策略与风控参数会在下一轮扫描生效；标记为“重启后生效”的参数需要重新启动程序。${settingsState.mode==='live'?'\n\n当前是实盘模式，请再次确认仓位和风控数值。':''}`))return;const btn=$('saveSettings');btn.disabled=true;btn.textContent='正在保存…';try{const r=await fetch('/v1/settings',{method:'POST',headers:{'Content-Type':'application/json','X-Config-Intent':'save'},body:JSON.stringify(next)});if(!r.ok)throw new Error((await r.text()).trim());settingsState=await r.json();const changed=(settingsState.changed_sections||[]).join('、')||'没有数值变化';settingsMessage=`已保存：${changed}。${settingsState.applied_after_next_cycle?'策略/风控将在下一轮扫描生效。':''}${settingsState.restart_required?'其余修改需要重启程序。':''}`}catch(err){settingsMessage='失败：'+err.message}render()}
+  const empty=t=>`<div class="empty">${esc(t)}</div>`;
+  function render(){const h=snapshot.health||{};$('mode').textContent=(h.mode||'—').toUpperCase();$('positive').textContent=h.positive_funding_markets??snapshot.funding.length;$('matched').textContent=h.monitored_bsc_tokens??'—';$('opportunityCount').textContent=h.opportunities??snapshot.opportunities.length;$('positionCount').textContent=h.positions??Object.keys(snapshot.positions||{}).length;const live=(h.mode||'').toLowerCase()==='live';const mr=Number(h.account_margin_ratio_percent||0);$('marginRatio').textContent=live?n(mr,1)+'%':'—';$('marginRatio').className='value '+(mr>=80?'neg':mr>=55?'warn':'pos');$('availableMargin').textContent=live?'$'+n(h.account_available_balance_usdt):'—';const pnl=Number(h.daily_realized_pnl_usdt||0);$('dailyPnl').textContent=(pnl>=0?'+':'')+'$'+n(pnl);$('dailyPnl').className='value '+(pnl>=0?'pos':'neg');if(active==='settings'){$('content').innerHTML=renderSettings();bindSettings()}else $('content').innerHTML=active==='funding'?rowsFunding():active==='opportunities'?rowsOpportunities():active==='positions'?rowsPositions():rowsLedger()}
+  async function load(){try{const [health,funding,opportunities,positions,ledger]=await Promise.all(['/healthz','/v1/funding','/v1/opportunities','/v1/positions','/v1/ledger'].map(async u=>{const r=await fetch(u,{cache:'no-store'});if(!r.ok)throw new Error(`${u} HTTP ${r.status}`);return r.json()}));snapshot={health,funding,opportunities,positions,ledger};$('error').style.display='none';const paused=Boolean(health.entry_paused_by_margin);setStatus(!paused&&(health.status==='ok'||health.status==='starting'),paused?'风控暂停开仓':health.status==='ok'?'运行正常':health.status==='starting'?'正在启动':'运行降级');$('lastUpdate').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false})+(health.last_success?' · 数据 '+time(health.last_success):'');render()}catch(err){setStatus(false,'连接失败');$('error').textContent='读取监控数据失败：'+err.message;$('error').style.display='block'}}
+  document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');active=b.dataset.tab;$('search').style.display=active==='settings'?'none':'';if(active==='settings')loadSettings();else render()}));$('search').addEventListener('input',render);load();setInterval(load,REFRESH_SECONDS*1000);
+</script>
+</body>
+</html>
