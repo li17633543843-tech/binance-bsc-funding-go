@@ -92,6 +92,14 @@ type OKXCatalogToken struct {
 	CommunityRecognized  bool   `json:"-"`
 }
 
+type PositionExitQuote struct {
+	TokenQty       float64
+	ReferenceUSDT  float64
+	OutputUSDT     float64
+	ExecutionPrice float64
+	PriceImpactBPS float64
+}
+
 type okxTokenTags struct {
 	CommunityRecognized bool `json:"communityRecognized"`
 }
@@ -529,6 +537,34 @@ func (p *OKXDEXClient) BestQuote(ctx context.Context, t TokenConfig, notional, r
 	return ChainQuote{Symbol: t.Symbol, Route: buy.Router, DEXes: quoteDEXes(buy), InputUSDT: notional, OutputTokens: tokens, BuyPrice: buyPrice, SellPrice: sellUSDT / tokens, RoundTripLossBPS: math.Max(0, (notional-sellUSDT)/notional*10000), DepthImpactBPS: math.Abs(okxImpact) * 100, GasEstimate: gas, OKXPriceImpactPercent: okxImpact}, nil
 }
 
+func (p *OKXDEXClient) positionExitQuote(ctx context.Context, t TokenConfig, tokenQty, referencePrice float64) (PositionExitQuote, error) {
+	if tokenQty <= 0 {
+		return PositionExitQuote{}, fmt.Errorf("sell quantity must be positive")
+	}
+	if referencePrice <= 0 {
+		return PositionExitQuote{}, fmt.Errorf("sell reference price must be positive")
+	}
+	quote, out, err := p.quote(ctx, t.BSCAddress, p.bsc.USDTAddress, units(tokenQty, t.Decimals))
+	if err != nil {
+		return PositionExitQuote{}, err
+	}
+	value := decimal(out, p.bsc.USDTDecimals)
+	if value <= 0 {
+		return PositionExitQuote{}, fmt.Errorf("OKX DEX sell quote for %s returned zero", t.Symbol)
+	}
+	impactPercent, err := strconv.ParseFloat(strings.TrimSpace(quote.PriceImpact), 64)
+	if err != nil || math.IsNaN(impactPercent) || math.IsInf(impactPercent, 0) {
+		return PositionExitQuote{}, fmt.Errorf("OKX DEX sell quote for %s returned invalid price impact %q", t.Symbol, quote.PriceImpact)
+	}
+	return PositionExitQuote{
+		TokenQty:       tokenQty,
+		ReferenceUSDT:  tokenQty * referencePrice,
+		OutputUSDT:     value,
+		ExecutionPrice: value / tokenQty,
+		PriceImpactBPS: math.Abs(impactPercent) * 100,
+	}, nil
+}
+
 func (p *OKXDEXClient) SellQuote(ctx context.Context, t TokenConfig, tokenQty float64) (float64, error) {
 	if tokenQty <= 0 {
 		return 0, fmt.Errorf("sell quantity must be positive")
@@ -542,6 +578,35 @@ func (p *OKXDEXClient) SellQuote(ctx context.Context, t TokenConfig, tokenQty fl
 		return 0, fmt.Errorf("OKX DEX sell quote for %s returned zero", t.Symbol)
 	}
 	return value, nil
+}
+
+// PositionExitCapacity probes the actual held token quantity in the executable
+// token-to-USDT direction. It intentionally does not reuse entry depth: failure
+// of a target or 3x target buy quote must only block entries, never force-close
+// a smaller existing position.
+func (p *OKXDEXClient) PositionExitCapacity(ctx context.Context, t TokenConfig, tokenQty, referencePrice, maxImpactBPS float64) (float64, PositionExitQuote, error) {
+	if tokenQty <= 0 || referencePrice <= 0 || maxImpactBPS <= 0 {
+		return 0, PositionExitQuote{}, fmt.Errorf("position exit capacity inputs must be positive")
+	}
+	currentNotional := tokenQty * referencePrice
+	minProbeNotional := math.Min(currentNotional, 1)
+	fractions := []float64{1, .75, .5, .25, .125, .0625}
+	var last PositionExitQuote
+	for _, fraction := range fractions {
+		probeNotional := currentNotional * fraction
+		if probeNotional+1e-9 < minProbeNotional {
+			continue
+		}
+		quote, err := p.positionExitQuote(ctx, t, tokenQty*fraction, referencePrice)
+		if err != nil {
+			return 0, PositionExitQuote{}, err
+		}
+		last = quote
+		if quote.PriceImpactBPS <= maxImpactBPS {
+			return probeNotional, quote, nil
+		}
+	}
+	return 0, last, nil
 }
 
 func (p *OKXDEXClient) DepthCapacity(ctx context.Context, t TokenConfig, c Config) (float64, ChainQuote, error) {

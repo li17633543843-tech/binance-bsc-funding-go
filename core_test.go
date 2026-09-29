@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -193,20 +194,80 @@ func TestMaxSafeNotionalUsesAllCaps(t *testing.T) {
 
 func TestDepthReductionPolicyHasHysteresisAndFundingGuard(t *testing.T) {
 	policy := DepthPolicy{TriggerPercent: 10, MinReductionPercent: 5, EmergencyShortfallPercent: 50}
-	if got := depthReductionFraction(105, 100, true, policy); got != 0 {
+	if got := positionDepthReductionFraction(105, 100, true, policy); got != 0 {
 		t.Fatalf("small depth fluctuation reduced position: %f", got)
 	}
-	if got := depthReductionFraction(120, 100, true, policy); math.Abs(got-1.0/6.0) > 1e-9 {
+	if got := positionDepthReductionFraction(120, 100, true, policy); math.Abs(got-1.0/6.0) > 1e-9 {
 		t.Fatalf("confirmed depth reduction fraction wrong: %f", got)
 	}
-	if got := depthReductionFraction(120, 100, false, policy); got != 0 {
+	if got := positionDepthReductionFraction(120, 100, false, policy); got != 0 {
 		t.Fatalf("ordinary depth reduction happened before first funding settlement: %f", got)
 	}
-	if got := depthReductionFraction(250, 100, false, policy); math.Abs(got-.6) > 1e-9 {
-		t.Fatalf("emergency depth shortfall was blocked: %f", got)
+	if got := positionDepthReductionFraction(250, 100, false, policy); math.Abs(got-.4) > 1e-9 {
+		t.Fatalf("emergency reduction must stay within executable sell capacity: %f", got)
 	}
-	if got := depthReductionFraction(100, 0, false, policy); got != 1 {
-		t.Fatalf("zero safe capacity did not close position: %f", got)
+	if got := positionDepthReductionFraction(100, 0, true, policy); got != 0 {
+		t.Fatalf("zero measured sell capacity must not cause a blind close: %f", got)
+	}
+}
+
+func TestPositionExitCapacityUsesActualSellSideAndCurrentSize(t *testing.T) {
+	const tokenAddress = "0x1111111111111111111111111111111111111111"
+	const usdtAddress = "0x2222222222222222222222222222222222222222"
+	var amounts []int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v6/dex/aggregator/quote" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if !strings.EqualFold(r.URL.Query().Get("fromTokenAddress"), tokenAddress) || !strings.EqualFold(r.URL.Query().Get("toTokenAddress"), usdtAddress) {
+			t.Fatalf("position depth probe must use token-to-USDT sell direction: %s", r.URL.RawQuery)
+		}
+		amount, err := strconv.ParseInt(r.URL.Query().Get("amount"), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		amounts = append(amounts, amount)
+		impact := "0.30"
+		if amount <= 75 {
+			impact = "0.05"
+		}
+		response := map[string]any{
+			"code": "0",
+			"msg":  "",
+			"data": []any{map[string]any{
+				"chainIndex":         "56",
+				"fromTokenAmount":    strconv.FormatInt(amount, 10),
+				"toTokenAmount":      strconv.FormatInt(amount*1_000_000, 10),
+				"estimateGasFee":     "100000",
+				"priceImpactPercent": impact,
+				"router":             "test-router",
+				"fromToken":          map[string]any{"tokenContractAddress": tokenAddress, "tokenSymbol": "TEST", "taxRate": "0", "isHoneyPot": false},
+				"toToken":            map[string]any{"tokenContractAddress": usdtAddress, "tokenSymbol": "USDT", "taxRate": "0", "isHoneyPot": false},
+			}},
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &OKXDEXClient{
+		bsc:        BSCConfig{ChainID: 56, USDTAddress: usdtAddress, USDTDecimals: 6},
+		cfg:        OKXDEXConfig{BaseURL: server.URL},
+		http:       server.Client(),
+		apiKey:     "test",
+		secret:     "test",
+		passphrase: "test",
+		projectID:  "test",
+	}
+	token := TokenConfig{Symbol: "TEST", BSCAddress: tokenAddress, Decimals: 0}
+	capacity, quote, err := client.PositionExitCapacity(t.Context(), token, 100, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity != 75 || quote.TokenQty != 75 || quote.PriceImpactBPS != 5 {
+		t.Fatalf("unexpected sell capacity: capacity=%f quote=%+v", capacity, quote)
+	}
+	if len(amounts) != 2 || amounts[0] != 100 || amounts[1] != 75 {
+		t.Fatalf("expected descending probes of the real position, got %v", amounts)
 	}
 }
 

@@ -141,19 +141,22 @@ type DepthPolicy struct {
 	EmergencyShortfallPercent float64
 }
 
-func depthReductionFraction(current, safe float64, fundingSettled bool, policy DepthPolicy) float64 {
-	if current <= 0 || safe >= current {
+// positionDepthReductionFraction limits each reduction to a sell amount that
+// was itself quoted inside the configured impact limit. A zero measured sell
+// capacity is not permission to blindly liquidate the whole position.
+func positionDepthReductionFraction(current, sellCapacity float64, fundingSettled bool, policy DepthPolicy) float64 {
+	if current <= 0 || sellCapacity >= current || sellCapacity <= 0 {
 		return 0
 	}
-	if safe <= 0 {
-		return 1
-	}
-	overagePercent := (current/safe - 1) * 100
+	overagePercent := (current/sellCapacity - 1) * 100
 	if overagePercent < policy.TriggerPercent {
 		return 0
 	}
-	fraction := math.Min(1, (current-safe)/current)
-	shortfallPercent := fraction * 100
+	// Reduce toward the measured capacity, but never submit a reduction larger
+	// than the largest sell chunk that passed the real token-to-USDT quote.
+	reductionNotional := math.Min(current-sellCapacity, sellCapacity)
+	fraction := math.Min(1, reductionNotional/current)
+	shortfallPercent := (current - sellCapacity) / current * 100
 	if !fundingSettled && shortfallPercent < policy.EmergencyShortfallPercent {
 		return 0
 	}

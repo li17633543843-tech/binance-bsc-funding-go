@@ -684,30 +684,31 @@ func (e *Engine) manageDepthSpreadAndHedge(ctx context.Context, now time.Time, m
 			slog.Warn("position chain checks skipped; token configuration unavailable", "symbol", symbol, "address", p.TokenAddress)
 			continue
 		}
-		capacity, _, err := e.chain.DepthCapacity(ctx, t, e.cfg)
+		current := p.TokenQty * m.IndexPrice
+		capacity, exitQuote, err := e.chain.PositionExitCapacity(ctx, t, p.TokenQty, m.IndexPrice, e.cfg.Risk.MaxChainPriceImpactBPS)
 		if err != nil {
 			e.fail(ctx, "position-depth-"+symbol, err)
 			continue
 		}
-		safe := maxSafeNotional(e.cfg, t, capacity)
-		current := p.TokenQty * m.IndexPrice
 		fundingSettled := p.LastFundingTime.After(p.OpenedAt)
-		fraction := depthReductionFraction(current, safe, fundingSettled, policy)
-		breachCount, confirmed := confirmDepthBreach(e.state.DepthBreachScans[symbol], fraction > 0, e.cfg.Risk.DepthBreachConfirmations)
+		fraction := positionDepthReductionFraction(current, capacity, fundingSettled, policy)
+		breached := capacity+1e-9 < current
+		breachCount, confirmed := confirmDepthBreach(e.state.DepthBreachScans[symbol], breached, e.cfg.Risk.DepthBreachConfirmations)
 		e.state.DepthBreachScans[symbol] = breachCount
-		if fraction > 0 && !confirmed {
-			slog.Warn("chain depth breach awaiting confirmation", "symbol", symbol, "scan", breachCount, "required", e.cfg.Risk.DepthBreachConfirmations, "current_usdt", current, "safe_usdt", safe, "reduction_percent", fraction*100)
+		if breached && !confirmed {
+			slog.Warn("position sell depth breach awaiting confirmation", "symbol", symbol, "scan", breachCount, "required", e.cfg.Risk.DepthBreachConfirmations, "current_usdt", current, "safe_sell_chunk_usdt", capacity, "sell_impact_bps", exitQuote.PriceImpactBPS, "planned_reduction_percent", fraction*100)
 		}
 		if fraction > 0 && confirmed {
-			_ = e.alert.Send(ctx, "depth-reduce-"+symbol, "WARNING", fmt.Sprintf("%s position %.2f exceeds chain-safe %.2f USDT; reducing %.1f%%", symbol, current, safe, fraction*100))
+			_ = e.alert.Send(ctx, "depth-reduce-"+symbol, "WARNING", fmt.Sprintf("%s position %.2f exceeds executable sell chunk %.2f USDT; reducing %.1f%%", symbol, current, capacity, fraction*100))
 			if err := e.reducePosition(ctx, p, fraction, "chain_depth_limit", &m); err != nil {
 				e.fail(ctx, "depth-reduce-"+symbol, err)
 				continue
 			}
 			e.state.DepthBreachScans[symbol] = 0
-			if fraction >= .999 {
-				continue
-			}
+		}
+		if breached && confirmed && capacity <= 0 && breachCount == e.cfg.Risk.DepthBreachConfirmations {
+			slog.Error("no sell chunk meets chain impact limit; holding position instead of blind close", "symbol", symbol, "current_usdt", current, "smallest_probe_impact_bps", exitQuote.PriceImpactBPS)
+			_ = e.alert.Send(ctx, "depth-hold-"+symbol, "CRITICAL", fmt.Sprintf("%s has no sell chunk inside the %.2f bps impact limit; position is held and new entry remains blocked", symbol, e.cfg.Risk.MaxChainPriceImpactBPS))
 		}
 		if err := e.correctHedgeDrift(ctx, p); err != nil {
 			e.fail(ctx, "hedge-drift-"+symbol, err)
