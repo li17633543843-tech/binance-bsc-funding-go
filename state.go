@@ -9,12 +9,14 @@ import (
 	"time"
 )
 
+const currentStateVersion = 2
+
 func loadState(dir string) (*BotState, error) {
 	path := filepath.Join(dir, "state.json")
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		now := time.Now()
-		return &BotState{Version: 1, StartedAt: now, UpdatedAt: now, Positions: map[string]*Position{}, FundingEWMA: map[string]float64{}, FundingSamples: map[string]int{}, WeakFundingScans: map[string]int{}, FundingHistory: map[string][]FundingRecord{}, FundingStats: map[string]FundingStats{}, WeakFundingSettlements: map[string]int{}, EntryConfirmations: map[string]int{}, CooldownUntil: map[string]time.Time{}, DepthBreachScans: map[string]int{}, LiquidationBreachScans: map[string]int{}, DailyDate: now.Format("2006-01-02")}, nil
+		return &BotState{Version: currentStateVersion, StartedAt: now, UpdatedAt: now, Positions: map[string]*Position{}, FundingEWMA: map[string]float64{}, FundingSamples: map[string]int{}, WeakFundingScans: map[string]int{}, FundingHistory: map[string][]FundingRecord{}, FundingStats: map[string]FundingStats{}, WeakFundingSettlements: map[string]int{}, EntryConfirmations: map[string]int{}, CooldownUntil: map[string]time.Time{}, DepthBreachScans: map[string]int{}, LiquidationBreachScans: map[string]int{}, PendingOperations: map[string]*PendingOperation{}, DailyDate: now.Format("2006-01-02")}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -23,7 +25,23 @@ func loadState(dir string) (*BotState, error) {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, err
 	}
-	if s.Version != 1 {
+	if s.Version == 1 {
+		// Preserve the exact pre-migration bytes once. This gives the server
+		// installer/operator a deterministic rollback source if a later live
+		// reconciliation rejects the migrated state.
+		backupPath := filepath.Join(dir, "state-v1-backup.json")
+		if _, statErr := os.Stat(backupPath); os.IsNotExist(statErr) {
+			if err := writeFileSynced(backupPath, b, 0600); err != nil {
+				return nil, fmt.Errorf("backup v1 state before migration: %w", err)
+			}
+		} else if statErr != nil {
+			return nil, fmt.Errorf("inspect v1 state backup: %w", statErr)
+		}
+		// Version 2 only adds an operation journal. Existing positions and all
+		// historical strategy state remain byte-for-byte meaningful.
+		s.Version = currentStateVersion
+	}
+	if s.Version != currentStateVersion {
 		return nil, fmt.Errorf("unsupported state version %d", s.Version)
 	}
 	if s.Positions == nil {
@@ -59,6 +77,9 @@ func loadState(dir string) (*BotState, error) {
 	if s.LiquidationBreachScans == nil {
 		s.LiquidationBreachScans = map[string]int{}
 	}
+	if s.PendingOperations == nil {
+		s.PendingOperations = map[string]*PendingOperation{}
+	}
 	return &s, nil
 }
 
@@ -73,10 +94,26 @@ func saveState(dir string, s *BotState) error {
 	}
 	tmp := filepath.Join(dir, "state.json.tmp")
 	path := filepath.Join(dir, "state.json")
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
+	if err := writeFileSynced(tmp, b, 0600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func writeFileSynced(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func appendLedger(dir string, event any) error {

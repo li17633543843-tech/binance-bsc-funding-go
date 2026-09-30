@@ -44,7 +44,9 @@
     "refresh_seconds": 10,
     "allow_lan": false,
     "username": "monitor",
-    "password_env": "FUNDING_BOT_DASHBOARD_PASSWORD"
+    "password_env": "FUNDING_BOT_DASHBOARD_PASSWORD",
+    "read_only_username": "viewer",
+    "read_only_password_env": "FUNDING_BOT_DASHBOARD_VIEWER_PASSWORD"
   },
   "strategy": {
     "target_positions": 25,
@@ -63,6 +65,7 @@
 	"min_cost_coverage_ratio": 2.5,
     "evaluation_hold_hours": 720,
 	"max_entry_payback_days": 10,
+	"max_entry_basis_bps": 100,
     "min_switch_apr_advantage_percent": 12.0,
     "min_switch_profit_usdt": 3.0,
     "min_position_age_hours_before_switch": 72,
@@ -97,7 +100,9 @@
     "max_hedge_drift_percent": 3,
     "max_data_age_seconds": 120,
     "max_consecutive_failures": 3,
-    "max_daily_loss_usdt": 100
+    "max_daily_loss_usdt": 100,
+    "max_futures_margin_use_percent": 50,
+    "min_bsc_usdt_reserve": 20
   },
   "alerts": {
     "webhook_url_env": "FUNDING_BOT_WEBHOOK_URL",

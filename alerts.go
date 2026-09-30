@@ -29,36 +29,53 @@ func (a *Alerter) Send(ctx context.Context, key, level, message string) error {
 		a.mu.Unlock()
 		return nil
 	}
-	a.last[key] = time.Now()
 	a.mu.Unlock()
 	payload := map[string]any{"time": time.Now().UTC().Format(time.RFC3339), "level": level, "message": message}
 	var first error
+	attempted := false
 	if endpoint := os.Getenv(a.cfg.WebhookURLEnv); endpoint != "" {
+		attempted = true
 		b, _ := json.Marshal(payload)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
-		req.Header.Set("Content-Type", "application/json")
-		if resp, err := a.http.Do(req); err != nil {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
+		if err != nil {
 			first = err
 		} else {
-			resp.Body.Close()
-			if resp.StatusCode/100 != 2 {
-				first = fmt.Errorf("webhook HTTP %d", resp.StatusCode)
+			req.Header.Set("Content-Type", "application/json")
+			if resp, err := a.http.Do(req); err != nil {
+				first = err
+			} else {
+				resp.Body.Close()
+				if resp.StatusCode/100 != 2 {
+					first = fmt.Errorf("webhook HTTP %d", resp.StatusCode)
+				}
 			}
 		}
 	}
 	token, chat := os.Getenv(a.cfg.TelegramTokenEnv), os.Getenv(a.cfg.TelegramChatIDEnv)
 	if token != "" && chat != "" {
+		attempted = true
 		form := url.Values{"chat_id": {chat}, "text": {"[" + level + "] " + message}}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/sendMessage", bytes.NewBufferString(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		if resp, err := a.http.Do(req); err != nil && first == nil {
-			first = err
-		} else if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode/100 != 2 && first == nil {
-				first = fmt.Errorf("Telegram HTTP %d", resp.StatusCode)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/sendMessage", bytes.NewBufferString(form.Encode()))
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+		} else {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if resp, err := a.http.Do(req); err != nil && first == nil {
+				first = err
+			} else if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode/100 != 2 && first == nil {
+					first = fmt.Errorf("Telegram HTTP %d", resp.StatusCode)
+				}
 			}
 		}
+	}
+	if first == nil && attempted {
+		a.mu.Lock()
+		a.last[key] = time.Now()
+		a.mu.Unlock()
 	}
 	return first
 }

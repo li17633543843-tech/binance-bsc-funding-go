@@ -71,6 +71,17 @@ func applyTuning(c *Config, t TuningSettings) {
 	c.Dashboard.RefreshSeconds = t.DashboardRefreshSeconds
 	c.Strategy = t.Strategy
 	c.Risk = t.Risk
+	// Older ui-tuning.json files predate the basis guard. Preserve all saved
+	// controls while inheriting the safe default instead of failing startup.
+	if c.Strategy.MaxEntryBasisBPS == 0 {
+		c.Strategy.MaxEntryBasisBPS = 100
+	}
+	if c.Risk.MaxFuturesMarginUsePercent == 0 {
+		c.Risk.MaxFuturesMarginUsePercent = 50
+	}
+	if c.Risk.MinBSCUSDTReserve == 0 {
+		c.Risk.MinBSCUSDTReserve = 20
+	}
 }
 
 func tuningPath(stateDir string) string { return filepath.Join(stateDir, "ui-tuning.json") }

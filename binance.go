@@ -52,16 +52,29 @@ type BinanceSymbol struct {
 	Quote       string
 	StepSize    float64
 	MinQty      float64
+	LotStepSize float64
+	LotMinQty   float64
 	MinNotional float64
 }
 
 type OrderFill struct {
-	OrderID     int64
-	Symbol      string
-	Side        string
-	ExecutedQty float64
-	AvgPrice    float64
-	QuoteQty    float64
+	OrderID       int64
+	ClientOrderID string
+	Symbol        string
+	Side          string
+	ExecutedQty   float64
+	AvgPrice      float64
+	QuoteQty      float64
+}
+
+type binanceOrderResponse struct {
+	OrderID       int64  `json:"orderId"`
+	ClientOrderID string `json:"clientOrderId"`
+	Symbol        string `json:"symbol"`
+	Side          string `json:"side"`
+	ExecutedQty   string `json:"executedQty"`
+	AvgPrice      string `json:"avgPrice"`
+	CumQuote      string `json:"cumQuote"`
 }
 
 func NewBinanceClient(c BinanceConfig) *BinanceClient {
@@ -277,7 +290,14 @@ func (b *BinanceClient) Symbols(ctx context.Context) (map[string]BinanceSymbol, 
 		v := BinanceSymbol{Symbol: s.Symbol, Status: s.Status, Base: s.Base, Quote: s.Quote}
 		for _, f := range s.Filters {
 			switch f.Type {
-			case "LOT_SIZE", "MARKET_LOT_SIZE":
+			case "LOT_SIZE":
+				if x, e := strconv.ParseFloat(f.StepSize, 64); e == nil && x > 0 {
+					v.LotStepSize = x
+				}
+				if x, e := strconv.ParseFloat(f.MinQty, 64); e == nil && x > 0 {
+					v.LotMinQty = x
+				}
+			case "MARKET_LOT_SIZE":
 				if x, e := strconv.ParseFloat(f.StepSize, 64); e == nil && x > 0 {
 					v.StepSize = x
 				}
@@ -287,6 +307,10 @@ func (b *BinanceClient) Symbols(ctx context.Context) (map[string]BinanceSymbol, 
 			case "MIN_NOTIONAL":
 				v.MinNotional, _ = strconv.ParseFloat(f.Notional, 64)
 			}
+		}
+		if v.StepSize <= 0 {
+			v.StepSize = v.LotStepSize
+			v.MinQty = v.LotMinQty
 		}
 		out[s.Symbol] = v
 	}
@@ -370,10 +394,14 @@ func (b *BinanceClient) AccountRisk(ctx context.Context) (FuturesAccountRisk, er
 func (b *BinanceClient) PositionRisks(ctx context.Context) (map[string]PositionRisk, error) {
 	var rows []struct {
 		Symbol           string `json:"symbol"`
+		PositionSide     string `json:"positionSide"`
 		PositionAmt      string `json:"positionAmt"`
 		MarkPrice        string `json:"markPrice"`
+		EntryPrice       string `json:"entryPrice"`
 		LiquidationPrice string `json:"liquidationPrice"`
 		UnrealizedProfit string `json:"unRealizedProfit"`
+		Leverage         string `json:"leverage"`
+		MarginType       string `json:"marginType"`
 	}
 	if err := b.signed(ctx, http.MethodGet, "/fapi/v3/positionRisk", url.Values{}, &rows); err != nil {
 		return nil, err
@@ -382,13 +410,28 @@ func (b *BinanceClient) PositionRisks(ctx context.Context) (map[string]PositionR
 	for _, r := range rows {
 		p, _ := strconv.ParseFloat(r.PositionAmt, 64)
 		m, _ := strconv.ParseFloat(r.MarkPrice, 64)
+		entry, _ := strconv.ParseFloat(r.EntryPrice, 64)
 		l, _ := strconv.ParseFloat(r.LiquidationPrice, 64)
 		u, _ := strconv.ParseFloat(r.UnrealizedProfit, 64)
+		leverage, _ := strconv.Atoi(r.Leverage)
 		if r.Symbol != "" && p != 0 {
-			out[r.Symbol] = PositionRisk{Symbol: r.Symbol, PositionAmount: p, MarkPrice: m, LiquidationPrice: l, UnrealizedProfit: u}
+			out[r.Symbol] = PositionRisk{Symbol: r.Symbol, PositionSide: r.PositionSide, PositionAmount: p, MarkPrice: m, EntryPrice: entry, LiquidationPrice: l, UnrealizedProfit: u, Leverage: leverage, MarginType: strings.ToUpper(r.MarginType)}
 		}
 	}
 	return out, nil
+}
+
+// PositionMode returns true for hedge/dual-side mode. This strategy requires
+// one-way mode because every order and reconciliation invariant assumes one
+// net position per symbol.
+func (b *BinanceClient) PositionMode(ctx context.Context) (bool, error) {
+	var response struct {
+		DualSidePosition bool `json:"dualSidePosition"`
+	}
+	if err := b.signed(ctx, http.MethodGet, "/fapi/v1/positionSide/dual", url.Values{}, &response); err != nil {
+		return false, err
+	}
+	return response.DualSidePosition, nil
 }
 
 func (b *BinanceClient) PositionRisk(ctx context.Context, symbol string) (PositionRisk, error) {
@@ -416,28 +459,51 @@ func (b *BinanceClient) ConfigureSymbol(ctx context.Context, symbol string) erro
 }
 
 func (b *BinanceClient) MarketOrder(ctx context.Context, symbol, side string, qty float64, reduceOnly bool) (OrderFill, error) {
-	q := url.Values{"symbol": {symbol}, "side": {side}, "type": {"MARKET"}, "quantity": {strconv.FormatFloat(qty, 'f', -1, 64)}, "newOrderRespType": {"RESULT"}}
+	return b.marketOrder(ctx, symbol, side, qty, reduceOnly, "")
+}
+
+func (b *BinanceClient) MarketOrderTracked(ctx context.Context, symbol, side string, qty float64, reduceOnly bool, clientOrderID string) (OrderFill, error) {
+	if clientOrderID == "" || len(clientOrderID) > 36 {
+		return OrderFill{}, fmt.Errorf("invalid Binance client order id")
+	}
+	return b.marketOrder(ctx, symbol, side, qty, reduceOnly, clientOrderID)
+}
+
+func (b *BinanceClient) marketOrder(ctx context.Context, symbol, side string, qty float64, reduceOnly bool, clientOrderID string) (OrderFill, error) {
+	quantity := formatOrderQuantity(qty)
+	q := url.Values{"symbol": {symbol}, "side": {side}, "type": {"MARKET"}, "quantity": {quantity}, "newOrderRespType": {"RESULT"}}
 	if reduceOnly {
 		q.Set("reduceOnly", "true")
 	}
-	var r struct {
-		OrderID     int64  `json:"orderId"`
-		Symbol      string `json:"symbol"`
-		Side        string `json:"side"`
-		ExecutedQty string `json:"executedQty"`
-		AvgPrice    string `json:"avgPrice"`
-		CumQuote    string `json:"cumQuote"`
+	if clientOrderID != "" {
+		q.Set("newClientOrderId", clientOrderID)
 	}
+	var r binanceOrderResponse
 	if err := b.signed(ctx, http.MethodPost, "/fapi/v1/order", q, &r); err != nil {
 		return OrderFill{}, err
 	}
+	return parseOrderFill(r)
+}
+
+func (b *BinanceClient) OrderByClientID(ctx context.Context, symbol, clientOrderID string) (OrderFill, error) {
+	if symbol == "" || clientOrderID == "" {
+		return OrderFill{}, fmt.Errorf("symbol and client order id are required")
+	}
+	var r binanceOrderResponse
+	if err := b.signed(ctx, http.MethodGet, "/fapi/v1/order", url.Values{"symbol": {symbol}, "origClientOrderId": {clientOrderID}}, &r); err != nil {
+		return OrderFill{}, err
+	}
+	return parseOrderFill(r)
+}
+
+func parseOrderFill(r binanceOrderResponse) (OrderFill, error) {
 	qtyOut, _ := strconv.ParseFloat(r.ExecutedQty, 64)
 	price, _ := strconv.ParseFloat(r.AvgPrice, 64)
 	quote, _ := strconv.ParseFloat(r.CumQuote, 64)
 	if qtyOut <= 0 || price <= 0 {
 		return OrderFill{}, fmt.Errorf("Binance order %d returned no fill", r.OrderID)
 	}
-	return OrderFill{OrderID: r.OrderID, Symbol: r.Symbol, Side: r.Side, ExecutedQty: qtyOut, AvgPrice: price, QuoteQty: quote}, nil
+	return OrderFill{OrderID: r.OrderID, ClientOrderID: r.ClientOrderID, Symbol: r.Symbol, Side: r.Side, ExecutedQty: qtyOut, AvgPrice: price, QuoteQty: quote}, nil
 }
 
 func floorStep(qty, step float64) float64 {
@@ -445,4 +511,27 @@ func floorStep(qty, step float64) float64 {
 		return qty
 	}
 	return float64(int64((qty+step*1e-9)/step)) * step
+}
+
+func formatStepQuantity(qty, step float64) string {
+	qty = floorStep(qty, step)
+	precision := 8
+	if step > 0 {
+		text := strconv.FormatFloat(step, 'f', -1, 64)
+		if dot := strings.IndexByte(text, '.'); dot >= 0 {
+			precision = len(strings.TrimRight(text[dot+1:], "0"))
+		} else {
+			precision = 0
+		}
+	}
+	return strconv.FormatFloat(qty, 'f', precision, 64)
+}
+
+func formatOrderQuantity(qty float64) string {
+	text := strconv.FormatFloat(qty, 'f', 12, 64)
+	text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	if text == "" || text == "-0" {
+		return "0"
+	}
+	return text
 }

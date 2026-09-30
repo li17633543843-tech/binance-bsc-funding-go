@@ -75,10 +75,12 @@ type DiscoveryConfig struct {
 }
 
 type DashboardConfig struct {
-	RefreshSeconds int    `json:"refresh_seconds"`
-	AllowLAN       bool   `json:"allow_lan"`
-	Username       string `json:"username"`
-	PasswordEnv    string `json:"password_env"`
+	RefreshSeconds      int    `json:"refresh_seconds"`
+	AllowLAN            bool   `json:"allow_lan"`
+	Username            string `json:"username"`
+	PasswordEnv         string `json:"password_env"`
+	ReadOnlyUsername    string `json:"read_only_username,omitempty"`
+	ReadOnlyPasswordEnv string `json:"read_only_password_env,omitempty"`
 }
 
 type StrategyConfig struct {
@@ -98,6 +100,7 @@ type StrategyConfig struct {
 	MinCostCoverageRatio     float64 `json:"min_cost_coverage_ratio"`
 	EvaluationHoldHours      float64 `json:"evaluation_hold_hours"`
 	MaxEntryPaybackDays      float64 `json:"max_entry_payback_days"`
+	MaxEntryBasisBPS         float64 `json:"max_entry_basis_bps"`
 	MinSwitchAPRAdvantage    float64 `json:"min_switch_apr_advantage_percent"`
 	MinSwitchProfitUSDT      float64 `json:"min_switch_profit_usdt"`
 	MinPositionAgeHours      float64 `json:"min_position_age_hours_before_switch"`
@@ -134,6 +137,8 @@ type RiskConfig struct {
 	MaxDataAgeSeconds              int     `json:"max_data_age_seconds"`
 	MaxConsecutiveFailures         int     `json:"max_consecutive_failures"`
 	MaxDailyLossUSDT               float64 `json:"max_daily_loss_usdt"`
+	MaxFuturesMarginUsePercent     float64 `json:"max_futures_margin_use_percent"`
+	MinBSCUSDTReserve              float64 `json:"min_bsc_usdt_reserve"`
 }
 
 type AlertConfig struct {
@@ -191,6 +196,9 @@ func applyConfigDefaults(c *Config) {
 	if c.Strategy.MinCostCoverageRatio == 0 {
 		c.Strategy.MinCostCoverageRatio = 2.5
 	}
+	if c.Strategy.MaxEntryBasisBPS == 0 {
+		c.Strategy.MaxEntryBasisBPS = 100
+	}
 	if c.Risk.DepthReductionTriggerPercent == 0 {
 		c.Risk.DepthReductionTriggerPercent = 10
 	}
@@ -229,6 +237,12 @@ func applyConfigDefaults(c *Config) {
 	}
 	if c.Risk.AccountEmergencyReducePercent == 0 {
 		c.Risk.AccountEmergencyReducePercent = 50
+	}
+	if c.Risk.MaxFuturesMarginUsePercent == 0 {
+		c.Risk.MaxFuturesMarginUsePercent = 50
+	}
+	if c.Risk.MinBSCUSDTReserve == 0 {
+		c.Risk.MinBSCUSDTReserve = 20
 	}
 }
 
@@ -280,12 +294,18 @@ func (c Config) Validate() error {
 	if c.Dashboard.RefreshSeconds < 2 || c.Dashboard.RefreshSeconds > 300 {
 		return errors.New("dashboard.refresh_seconds must be between 2 and 300")
 	}
+	if (c.Dashboard.ReadOnlyUsername == "") != (c.Dashboard.ReadOnlyPasswordEnv == "") {
+		return errors.New("dashboard read-only username and password_env must be configured together")
+	}
+	if c.Dashboard.ReadOnlyUsername != "" && c.Dashboard.ReadOnlyUsername == c.Dashboard.Username {
+		return errors.New("dashboard admin and read-only usernames must differ")
+	}
 	for i, symbol := range c.Discovery.DenySymbols {
 		if symbol == "" || symbol != strings.ToUpper(symbol) {
 			return fmt.Errorf("auto_discovery.deny_symbols[%d] must be uppercase", i)
 		}
 	}
-	nums := []float64{c.Binance.TakerFeeBPS, c.BSC.SlippageBPS, c.BSC.GasReserveUSDT, c.BSC.MaxGasPriceGwei, c.Strategy.MinCurrentFundingBPS, c.Strategy.MinFundingAPRPercent, c.Strategy.FundingIntervalsPerYear, c.Strategy.FundingEWMAAlpha, c.Strategy.MinPositiveFundingRatio, c.Strategy.MaxCurrentToMedianRatio, c.Strategy.MinCostCoverageRatio, c.Strategy.EvaluationHoldHours, c.Strategy.MaxEntryPaybackDays, c.Strategy.MinSwitchAPRAdvantage, c.Strategy.MinSwitchProfitUSDT, c.Strategy.MinPositionAgeHours, c.Strategy.PriceSpreadTakeProfitBPS, c.Strategy.MinPriceArbNetUSDT, c.Strategy.PriceArbCooldownHours, c.Risk.TotalCapitalUSDT, c.Risk.TargetNotionalPerCoinUSDT, c.Risk.MaxNotionalPerCoinUSDT, c.Risk.MaxCapitalPerCoinPercent, c.Risk.DepthSafetyMultiplier, c.Risk.DepthReductionTriggerPercent, c.Risk.MinDepthReductionPercent, c.Risk.DepthEmergencyShortfallPct, c.Risk.DepthCloseCooldownHours, c.Risk.MaxChainPriceImpactBPS, c.Risk.ReferenceQuoteUSDT, c.Risk.MinLiquidationDistanceX, c.Risk.EmergencyLiquidationDistanceX, c.Risk.SlowReducePercent, c.Risk.AccountMarginStopEntryPercent, c.Risk.AccountMarginReducePercent, c.Risk.AccountMarginHighPercent, c.Risk.AccountMarginEmergencyPercent, c.Risk.AccountHighReducePercent, c.Risk.AccountEmergencyReducePercent, c.Risk.MaxHedgeDriftPercent, c.Risk.MaxDailyLossUSDT}
+	nums := []float64{c.Binance.TakerFeeBPS, c.BSC.SlippageBPS, c.BSC.GasReserveUSDT, c.BSC.MaxGasPriceGwei, c.Strategy.MinCurrentFundingBPS, c.Strategy.MinFundingAPRPercent, c.Strategy.FundingIntervalsPerYear, c.Strategy.FundingEWMAAlpha, c.Strategy.MinPositiveFundingRatio, c.Strategy.MaxCurrentToMedianRatio, c.Strategy.MinCostCoverageRatio, c.Strategy.EvaluationHoldHours, c.Strategy.MaxEntryPaybackDays, c.Strategy.MaxEntryBasisBPS, c.Strategy.MinSwitchAPRAdvantage, c.Strategy.MinSwitchProfitUSDT, c.Strategy.MinPositionAgeHours, c.Strategy.PriceSpreadTakeProfitBPS, c.Strategy.MinPriceArbNetUSDT, c.Strategy.PriceArbCooldownHours, c.Risk.TotalCapitalUSDT, c.Risk.TargetNotionalPerCoinUSDT, c.Risk.MaxNotionalPerCoinUSDT, c.Risk.MaxCapitalPerCoinPercent, c.Risk.DepthSafetyMultiplier, c.Risk.DepthReductionTriggerPercent, c.Risk.MinDepthReductionPercent, c.Risk.DepthEmergencyShortfallPct, c.Risk.DepthCloseCooldownHours, c.Risk.MaxChainPriceImpactBPS, c.Risk.ReferenceQuoteUSDT, c.Risk.MinLiquidationDistanceX, c.Risk.EmergencyLiquidationDistanceX, c.Risk.SlowReducePercent, c.Risk.AccountMarginStopEntryPercent, c.Risk.AccountMarginReducePercent, c.Risk.AccountMarginHighPercent, c.Risk.AccountMarginEmergencyPercent, c.Risk.AccountHighReducePercent, c.Risk.AccountEmergencyReducePercent, c.Risk.MaxHedgeDriftPercent, c.Risk.MaxDailyLossUSDT, c.Risk.MaxFuturesMarginUsePercent, c.Risk.MinBSCUSDTReserve}
 	for _, v := range nums {
 		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 			return errors.New("numeric settings must be finite and nonnegative")
@@ -296,6 +316,9 @@ func (c Config) Validate() error {
 	}
 	if c.Strategy.FundingHistoryDays < 30 || c.Strategy.FundingHistoryDays > 90 || c.Strategy.MinFundingHistorySamples < 3 || c.Strategy.MinFundingHistorySamples > 1000 || c.Strategy.MinPositiveFundingRatio <= 0 || c.Strategy.MinPositiveFundingRatio > 1 || c.Strategy.MaxCurrentToMedianRatio < 1 || c.Strategy.EntryConfirmationScans < 1 || c.Strategy.EntryConfirmationScans > 10 || c.Strategy.WeakFundingSettlements < 1 || c.Strategy.WeakFundingSettlements > 10 || c.Strategy.MinCostCoverageRatio < 1 {
 		return errors.New("invalid historical funding, entry confirmation or cost coverage settings")
+	}
+	if c.Strategy.MaxEntryBasisBPS <= 0 || c.Strategy.MaxEntryBasisBPS > 1000 {
+		return errors.New("max_entry_basis_bps must be between 0 and 1000")
 	}
 	if c.Risk.TotalCapitalUSDT <= 0 || c.Risk.TargetNotionalPerCoinUSDT <= 0 || c.Risk.MaxNotionalPerCoinUSDT < c.Risk.TargetNotionalPerCoinUSDT || c.Risk.MaxCapitalPerCoinPercent <= 0 || c.Risk.MaxCapitalPerCoinPercent > 100 {
 		return errors.New("invalid capital limits")
@@ -317,6 +340,9 @@ func (c Config) Validate() error {
 	}
 	if c.Risk.MaxHedgeDriftPercent <= 0 || c.BSC.SlippageBPS > 500 || c.Risk.MaxChainPriceImpactBPS > 1000 || (c.Strategy.PriceSpreadTakeProfitBPS > 0 && c.Strategy.PriceArbCooldownHours <= 0) {
 		return errors.New("invalid slippage, impact, hedge drift or spread cooldown")
+	}
+	if c.Risk.MaxFuturesMarginUsePercent <= 0 || c.Risk.MaxFuturesMarginUsePercent > 100 {
+		return errors.New("max_futures_margin_use_percent must be between 0 and 100")
 	}
 	if c.Risk.MaxDataAgeSeconds < c.ScanSeconds || c.Risk.MaxConsecutiveFailures < 1 {
 		return errors.New("invalid stale/failure limits")
@@ -365,6 +391,9 @@ func (c Config) Validate() error {
 	}
 	if c.Mode == "live" && c.LiveUnlock != liveUnlockPhrase {
 		return errors.New("live mode requires the exact live_unlock phrase")
+	}
+	if c.Mode == "live" && (c.Dashboard.Username == "" || c.Dashboard.PasswordEnv == "") {
+		return errors.New("live mode requires dashboard administrator authentication")
 	}
 	if c.Mode == "live" && strings.EqualFold(c.BSC.WalletAddress, "0x0000000000000000000000000000000000000000") {
 		return errors.New("live mode requires a nonzero wallet address")

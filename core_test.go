@@ -51,6 +51,13 @@ func TestAnnualizedFunding(t *testing.T) {
 	}
 }
 
+func TestOrderQuantityFormattingDoesNotExposeFloatNoise(t *testing.T) {
+	qty := floorStep(1.235, .001)
+	if got := formatOrderQuantity(qty); got != "1.235" {
+		t.Fatalf("quantity %0.18f formatted as %q", qty, got)
+	}
+}
+
 func TestFundingStatsUseSettlementsAndResistOneSpike(t *testing.T) {
 	now := time.Date(2026, 9, 27, 8, 0, 0, 0, time.UTC)
 	records := make([]FundingRecord, 0, 31)
@@ -315,15 +322,43 @@ func TestLoadStateBackfillsDepthBreachCounters(t *testing.T) {
 
 func TestSwitchNeedsAgeYieldAndProfit(t *testing.T) {
 	c := Config{Strategy: StrategyConfig{MinPositionAgeHours: 72, MinSwitchAPRAdvantage: 10, MinSwitchProfitUSDT: 2}}
-	current := Opportunity{NetAPRPercent: 20}
-	replacement := Opportunity{NetAPRPercent: 35, ExpectedHoldProfit: 5, RoundTripCostUSDT: 1}
-	p := Position{OpenedAt: time.Now().Add(-100 * time.Hour)}
+	current := Opportunity{Symbol: "OLDUSDT", NetAPRPercent: 20}
+	replacement := Opportunity{Symbol: "NEWUSDT", NetAPRPercent: 35, ExpectedHoldProfit: 5, RoundTripCostUSDT: 1}
+	p := Position{Symbol: "OLDUSDT", OpenedAt: time.Now().Add(-100 * time.Hour)}
 	if !shouldSwitch(current, replacement, p, c, time.Now()) {
 		t.Fatal("expected switch")
 	}
 	p.OpenedAt = time.Now().Add(-2 * time.Hour)
 	if shouldSwitch(current, replacement, p, c, time.Now()) {
 		t.Fatal("switched too early")
+	}
+}
+
+func TestSwitchRejectsCandidateThatReleasedCapitalCannotFund(t *testing.T) {
+	c := Config{Strategy: StrategyConfig{MinPositionAgeHours: 24, MinSwitchAPRAdvantage: 5, MinSwitchProfitUSDT: 1, EvaluationHoldHours: 30 * 24}}
+	current := Opportunity{Symbol: "OLDUSDT", NetAPRPercent: 10, FundingAPRPercent: 10}
+	replacement := Opportunity{Symbol: "NEWUSDT", TargetNotionalUSDT: 300, NetAPRPercent: 40, ExpectedHoldProfit: 20}
+	p := Position{Symbol: "OLDUSDT", SpotCostUSDT: 100, ShortQty: 10, ShortEntryPrice: 10, OpenedAt: time.Now().Add(-100 * time.Hour)}
+	if shouldSwitch(current, replacement, p, c, time.Now()) {
+		t.Fatal("weak-funding exit selected a replacement that released capital cannot fund")
+	}
+}
+
+func TestProfitExitNeedsBetterUseForReleasedCapital(t *testing.T) {
+	c := Config{Strategy: StrategyConfig{EvaluationHoldHours: 30 * 24, MinSwitchAPRAdvantage: 5, MinSwitchProfitUSDT: 1}}
+	p := Position{Symbol: "OLDUSDT", SpotCostUSDT: 100}
+	currentNotional := 100.0
+	if betterDestinationForProfitExit(p, currentNotional, 24, Opportunity{Symbol: "NEWUSDT", TargetNotionalUSDT: 100, NetAPRPercent: 25, ExpectedHoldProfit: 5}, c) {
+		t.Fatal("candidate with insufficient APR advantage replaced current funding")
+	}
+	if betterDestinationForProfitExit(p, currentNotional, 24, Opportunity{Symbol: "NEWUSDT", TargetNotionalUSDT: 100, NetAPRPercent: 35, ExpectedHoldProfit: 2}, c) {
+		t.Fatal("candidate with insufficient absolute profit replaced current funding")
+	}
+	if betterDestinationForProfitExit(p, currentNotional, 24, Opportunity{Symbol: "NEWUSDT", TargetNotionalUSDT: 300, NetAPRPercent: 35, ExpectedHoldProfit: 5}, c) {
+		t.Fatal("larger candidate was attributed to capital released by this position")
+	}
+	if !betterDestinationForProfitExit(p, currentNotional, 24, Opportunity{Symbol: "NEWUSDT", TargetNotionalUSDT: 100, NetAPRPercent: 35, ExpectedHoldProfit: 5}, c) {
+		t.Fatal("genuinely better destination was rejected")
 	}
 }
 
@@ -517,6 +552,27 @@ func TestDashboardAndLANAuthentication(t *testing.T) {
 	}
 }
 
+func TestDashboardReadOnlyAccountCannotChangeSettings(t *testing.T) {
+	e := &Engine{cfg: Config{Dashboard: DashboardConfig{RefreshSeconds: 10}}, health: Health{Status: "ok", Portfolio: map[string]PositionView{}}}
+	handler := dashboardHandlerWithAuth(e, dashboardAuth{AdminUsername: "admin", AdminPassword: "admin-secret", ViewerUsername: "viewer", ViewerPassword: "viewer-secret"})
+
+	get := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	get.SetBasicAuth("viewer", "viewer-secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, get)
+	if response.Code != http.StatusOK {
+		t.Fatalf("viewer GET returned %d", response.Code)
+	}
+
+	post := httptest.NewRequest(http.MethodPost, "/v1/settings", strings.NewReader(`{}`))
+	post.SetBasicAuth("viewer", "viewer-secret")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, post)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("viewer POST returned %d", response.Code)
+	}
+}
+
 func TestDashboardSettingsSaveValidateAndApplyAtCycleBoundary(t *testing.T) {
 	cfg, err := loadConfig("config.example.json")
 	if err != nil {
@@ -653,5 +709,103 @@ func TestLedgerNewestFirstAndLimited(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0]["sequence"] != float64(3) || rows[1]["sequence"] != float64(2) {
 		t.Fatalf("unexpected ledger order: %+v", rows)
+	}
+}
+
+func TestStateV1MigratesAndPreservesPositions(t *testing.T) {
+	dir := t.TempDir()
+	opened := time.Date(2026, 9, 29, 1, 2, 3, 0, time.UTC)
+	raw := fmt.Sprintf(`{"version":1,"started_at":%q,"positions":{"CAKEUSDT":{"symbol":"CAKEUSDT","token_address":"0x1111111111111111111111111111111111111111","token_decimals":18,"token_qty":10,"short_qty":10,"opened_at":%q}}}`, opened.Format(time.RFC3339), opened.Format(time.RFC3339))
+	if err := os.WriteFile(dir+string(os.PathSeparator)+"state.json", []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Version != currentStateVersion || state.Positions["CAKEUSDT"] == nil {
+		t.Fatalf("migration lost live state: version=%d positions=%+v", state.Version, state.Positions)
+	}
+	if state.PendingOperations == nil {
+		t.Fatal("migration did not initialize the persistent operation journal")
+	}
+	backup, err := os.ReadFile(dir + string(os.PathSeparator) + "state-v1-backup.json")
+	if err != nil {
+		t.Fatalf("migration did not create rollback backup: %v", err)
+	}
+	if string(backup) != raw {
+		t.Fatal("migration backup does not preserve the exact v1 state")
+	}
+}
+
+func TestPositionTokenUsesImmutableOpenedContract(t *testing.T) {
+	p := &Position{Symbol: "CAKEUSDT", TokenAddress: "0x1111111111111111111111111111111111111111", TokenDecimals: 9}
+	discovered := TokenConfig{Symbol: "CAKE", BinanceSymbol: "CAKEUSDT", BSCAddress: "0x2222222222222222222222222222222222222222", Decimals: 18, MaxNotionalUSDT: 500}
+	got, err := immutablePositionToken(p, discovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(got.BSCAddress, p.TokenAddress) || got.Decimals != p.TokenDecimals {
+		t.Fatalf("existing position drifted to discovery metadata: %+v", got)
+	}
+}
+
+func TestEntryEconomicsChargesPositiveCrossMarketBasis(t *testing.T) {
+	got := calculateEntryEconomics(300, 30, 720, 1, 0.30, 0.20, 500)
+	if math.Abs(got.BasisCostUSDT-15) > 1e-9 {
+		t.Fatalf("basis cost=%f want 15", got.BasisCostUSDT)
+	}
+	if got.RoundTripCostUSDT < 16.49 || got.ExpectedHoldProfitUSDT >= 0 {
+		t.Fatalf("entry economics ignored convergence loss: %+v", got)
+	}
+}
+
+func TestLiveEntryCapacityUsesBothAccountsAndConfiguredCap(t *testing.T) {
+	e := &Engine{
+		cfg:                Config{Mode: "live", Binance: BinanceConfig{Leverage: 5}, Risk: RiskConfig{TotalCapitalUSDT: 1000, MaxFuturesMarginUsePercent: 50, MinBSCUSDTReserve: 20}},
+		state:              &BotState{Positions: map[string]*Position{"OLDUSDT": {SpotCostUSDT: 300}}},
+		accountRisk:        FuturesAccountRisk{AvailableBalance: 100},
+		chainAvailableUSDT: 400,
+	}
+	// Config has 700 left, spot has 380 left, futures permits 250 notional.
+	if got := e.availableEntryNotional(); math.Abs(got-250) > 1e-9 {
+		t.Fatalf("available entry notional=%f want 250", got)
+	}
+}
+
+func TestRiskIncreaseGateBlocksPendingOperationAndStalePosition(t *testing.T) {
+	now := time.Now()
+	e := &Engine{
+		cfg:               Config{Mode: "live", Risk: RiskConfig{MaxDataAgeSeconds: 120, MaxDailyLossUSDT: 100}},
+		accountReconciled: true,
+		state: &BotState{
+			Positions:         map[string]*Position{"CAKEUSDT": {Symbol: "CAKEUSDT"}},
+			PendingOperations: map[string]*PendingOperation{"op-1": {ID: "op-1", Symbol: "CAKEUSDT", Stage: "spot_submitted"}},
+		},
+	}
+	markets := map[string]FundingMarket{"CAKEUSDT": {Symbol: "CAKEUSDT", UpdatedAt: now}}
+	if got := e.riskIncreaseBlockReason(now, markets); !strings.Contains(got, "pending operation") {
+		t.Fatalf("pending operation did not close the risk gate: %q", got)
+	}
+	delete(e.state.PendingOperations, "op-1")
+	markets["CAKEUSDT"] = FundingMarket{Symbol: "CAKEUSDT", UpdatedAt: now.Add(-3 * time.Minute)}
+	if got := e.riskIncreaseBlockReason(now, markets); !strings.Contains(got, "stale market") {
+		t.Fatalf("stale position market did not close the risk gate: %q", got)
+	}
+	markets["CAKEUSDT"] = FundingMarket{Symbol: "CAKEUSDT", UpdatedAt: now}
+	e.state.DailyRealizedPnL = -100
+	if got := e.riskIncreaseBlockReason(now, markets); !strings.Contains(got, "daily loss") {
+		t.Fatalf("daily loss did not close the risk gate: %q", got)
+	}
+}
+
+func TestAlertInvalidWebhookReturnsErrorAndDoesNotConsumeCooldown(t *testing.T) {
+	t.Setenv("TEST_BAD_WEBHOOK", "://bad-url")
+	a := NewAlerter(AlertConfig{WebhookURLEnv: "TEST_BAD_WEBHOOK", CooldownSeconds: 300})
+	if err := a.Send(context.Background(), "risk", "ERROR", "first"); err == nil {
+		t.Fatal("invalid webhook must return an error")
+	}
+	if err := a.Send(context.Background(), "risk", "ERROR", "retry"); err == nil {
+		t.Fatal("failed delivery incorrectly consumed the retry cooldown")
 	}
 }

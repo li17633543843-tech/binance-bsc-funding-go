@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 type Health struct {
@@ -32,7 +34,14 @@ type Health struct {
 	AccountMarginRatio      float64                 `json:"account_margin_ratio_percent,omitempty"`
 	AccountMarginBalance    float64                 `json:"account_margin_balance_usdt,omitempty"`
 	AccountAvailableBalance float64                 `json:"account_available_balance_usdt,omitempty"`
+	BSCUSDTAvailable        float64                 `json:"bsc_usdt_available,omitempty"`
+	AvailableEntryNotional  float64                 `json:"available_entry_notional_usdt,omitempty"`
 	EntryPausedByMargin     bool                    `json:"entry_paused_by_margin"`
+	RiskIncreaseBlocked     bool                    `json:"risk_increase_blocked"`
+	RiskBlockReason         string                  `json:"risk_block_reason,omitempty"`
+	PendingOperations       int                     `json:"pending_operations"`
+	AccountReconciled       bool                    `json:"account_reconciled"`
+	ReconciliationError     string                  `json:"reconciliation_error,omitempty"`
 	RiskReduceCooldownUntil time.Time               `json:"risk_reduce_cooldown_until,omitempty"`
 	BinanceRateLimitUntil   time.Time               `json:"binance_rate_limit_until,omitempty"`
 	Portfolio               map[string]PositionView `json:"portfolio"`
@@ -46,37 +55,43 @@ type PositionView struct {
 	Median30DAPRPercent  float64 `json:"median_30d_apr_percent"`
 	PositiveFundingRatio float64 `json:"positive_funding_ratio"`
 	WeakSettlements      int     `json:"weak_funding_settlements"`
+	AllocationDecision   string  `json:"allocation_decision"`
 	HedgeDriftPercent    float64 `json:"hedge_drift_percent"`
 	LiquidationDistanceX float64 `json:"liquidation_distance_x,omitempty"`
 }
 
 type Engine struct {
-	cfg              Config
-	binance          *BinanceClient
-	chain            *OKXDEXClient
-	alert            *Alerter
-	state            *BotState
-	symbols          map[string]BinanceSymbol
-	tokens           map[string]TokenConfig
-	fundingHours     map[string]float64
-	manualTokens     map[string]TokenConfig
-	fundingWatch     []FundingWatch
-	nextDiscovery    time.Time
-	nextChainScan    time.Time
-	tokenSearchAt    map[string]time.Time
-	tokenMatchStatus map[string]string
-	autoDiscovered   int
-	ambiguousSymbols int
-	accountRisk      FuturesAccountRisk
-	positionRisks    map[string]PositionRisk
-	entryRiskPaused  bool
-	settingsMu       sync.Mutex
-	settingsConfig   Config
-	pendingStrategy  *StrategyConfig
-	pendingRisk      *RiskConfig
-	mu               sync.RWMutex
-	health           Health
-	opportunities    []Opportunity
+	cfg                 Config
+	binance             binanceGateway
+	chain               chainGateway
+	alert               *Alerter
+	state               *BotState
+	symbols             map[string]BinanceSymbol
+	tokens              map[string]TokenConfig
+	fundingHours        map[string]float64
+	manualTokens        map[string]TokenConfig
+	fundingWatch        []FundingWatch
+	nextDiscovery       time.Time
+	nextChainScan       time.Time
+	nextMetadataRefresh time.Time
+	tokenSearchAt       map[string]time.Time
+	tokenMatchStatus    map[string]string
+	autoDiscovered      int
+	ambiguousSymbols    int
+	accountRisk         FuturesAccountRisk
+	chainAvailableUSDT  float64
+	positionRisks       map[string]PositionRisk
+	entryRiskPaused     bool
+	accountReconciled   bool
+	reconciliationError string
+	positionDecisions   map[string]string
+	settingsMu          sync.Mutex
+	settingsConfig      Config
+	pendingStrategy     *StrategyConfig
+	pendingRisk         *RiskConfig
+	mu                  sync.RWMutex
+	health              Health
+	opportunities       []Opportunity
 }
 
 func NewEngine(ctx context.Context, c Config) (*Engine, error) {
@@ -104,6 +119,17 @@ func NewEngine(ctx context.Context, c Config) (*Engine, error) {
 		chain.Close()
 		return nil, err
 	}
+	if c.Mode == "live" {
+		dualSide, err := b.PositionMode(ctx)
+		if err != nil {
+			chain.Close()
+			return nil, fmt.Errorf("verify Binance position mode: %w", err)
+		}
+		if dualSide {
+			chain.Close()
+			return nil, fmt.Errorf("Binance hedge mode is not supported; switch Futures position mode to one-way before live trading")
+		}
+	}
 	manualTokens := map[string]TokenConfig{}
 	for _, t := range c.Tokens {
 		if t.Enabled {
@@ -123,7 +149,7 @@ func NewEngine(ctx context.Context, c Config) (*Engine, error) {
 	for symbol, token := range manualTokens {
 		tokens[symbol] = token
 	}
-	e := &Engine{cfg: c, settingsConfig: c, binance: b, chain: chain, alert: NewAlerter(c.Alerts), state: s, symbols: symbols, tokens: tokens, manualTokens: manualTokens, fundingHours: fundingHours, tokenSearchAt: map[string]time.Time{}, tokenMatchStatus: map[string]string{}, positionRisks: map[string]PositionRisk{}}
+	e := &Engine{cfg: c, settingsConfig: c, binance: b, chain: chain, alert: NewAlerter(c.Alerts), state: s, symbols: symbols, tokens: tokens, manualTokens: manualTokens, fundingHours: fundingHours, tokenSearchAt: map[string]time.Time{}, tokenMatchStatus: map[string]string{}, positionRisks: map[string]PositionRisk{}, positionDecisions: map[string]string{}, nextMetadataRefresh: time.Now().Add(6 * time.Hour)}
 	if c.Discovery.Enabled {
 		if err := e.refreshDiscovery(ctx, true); err != nil {
 			if len(manualTokens) == 0 {
@@ -134,11 +160,32 @@ func NewEngine(ctx context.Context, c Config) (*Engine, error) {
 		}
 	}
 	e.restorePositionTokens(ctx)
+	if c.Mode == "live" {
+		if err := e.reconcileLiveState(ctx); err != nil {
+			e.reconciliationError = err.Error()
+			slog.Error("startup account reconciliation failed; trading is locked", "error", err)
+		}
+	} else {
+		e.accountReconciled = true
+	}
 	e.health = Health{StartedAt: s.StartedAt, Mode: c.Mode, Status: "starting", Portfolio: map[string]PositionView{}}
 	return e, nil
 }
 
 func (e *Engine) Close() { e.chain.Close() }
+
+func (e *Engine) positionToken(p *Position) (TokenConfig, error) {
+	discovered := e.tokens[p.Symbol]
+	if discovered.Symbol == "" {
+		if rule, ok := e.symbols[p.Symbol]; ok {
+			discovered.Symbol = rule.Base
+		}
+	}
+	if discovered.MaxNotionalUSDT <= 0 {
+		discovered.MaxNotionalUSDT = e.cfg.Risk.MaxNotionalPerCoinUSDT
+	}
+	return immutablePositionToken(p, discovered)
+}
 
 func (e *Engine) restorePositionTokens(ctx context.Context) {
 	if len(e.state.Positions) == 0 {
@@ -152,8 +199,7 @@ func (e *Engine) restorePositionTokens(ctx context.Context) {
 			failed++
 			continue
 		}
-		if token, ok := e.tokens[symbol]; ok && strings.EqualFold(token.BSCAddress, position.TokenAddress) {
-			position.TokenDecimals = token.Decimals
+		if token, ok := e.tokens[symbol]; ok && strings.EqualFold(token.BSCAddress, position.TokenAddress) && position.TokenDecimals > 0 {
 			continue
 		}
 		matches, err := e.chain.SearchTokenAddress(ctx, position.TokenAddress)
@@ -169,7 +215,9 @@ func (e *Engine) restorePositionTokens(ctx context.Context) {
 			continue
 		}
 		e.tokens[symbol] = TokenConfig{Enabled: true, Symbol: rule.Base, BinanceSymbol: symbol, BSCAddress: matches[0].TokenContractAddress, Decimals: uint8(decimals), MaxNotionalUSDT: e.cfg.Risk.MaxNotionalPerCoinUSDT, VerifiedContract: true}
-		position.TokenDecimals = uint8(decimals)
+		if position.TokenDecimals == 0 {
+			position.TokenDecimals = uint8(decimals)
+		}
 		restored++
 	}
 	if restored > 0 {
@@ -417,8 +465,21 @@ func (e *Engine) runCycle(ctx context.Context) {
 	}
 	failuresAtStart := e.state.ConsecutiveFailures
 	e.resetDaily(now)
+	if e.cfg.Mode == "live" && !e.accountReconciled {
+		if err := e.reconcileLiveState(ctx); err != nil {
+			e.reconciliationError = err.Error()
+		} else {
+			e.reconciliationError = ""
+		}
+	}
+	hasPendingOperation := len(e.state.PendingOperations) > 0 || (e.cfg.Mode == "live" && !e.accountReconciled)
 	// Existing live positions get liquidation checks before candidate ranking or chain depth scans.
-	e.manageLiquidationRisk(ctx, now)
+	if !hasPendingOperation {
+		e.manageLiquidationRisk(ctx, now)
+	} else {
+		e.entryRiskPaused = true
+	}
+	hasPendingOperation = len(e.state.PendingOperations) > 0 || (e.cfg.Mode == "live" && !e.accountReconciled)
 	if e.pauseForBinanceRateLimit(time.Now()) {
 		e.persist()
 		return
@@ -429,6 +490,14 @@ func (e *Engine) runCycle(ctx context.Context) {
 		e.persist()
 		return
 	}
+	if !now.Before(e.nextMetadataRefresh) {
+		if err := e.refreshTradingMetadata(ctx); err != nil {
+			slog.Warn("Binance trading metadata refresh failed; retaining previous rules", "error", err)
+			e.nextMetadataRefresh = time.Now().Add(15 * time.Minute)
+		} else {
+			e.nextMetadataRefresh = time.Now().Add(6 * time.Hour)
+		}
+	}
 	if err := e.refreshDiscovery(ctx, false); err != nil {
 		slog.Warn("token auto-discovery refresh failed; keeping previous catalog", "error", err)
 	}
@@ -437,6 +506,16 @@ func (e *Engine) runCycle(ctx context.Context) {
 	if err := e.updateFunding(ctx, markets); err != nil {
 		e.fail(ctx, "funding-history", err)
 		e.persist()
+		return
+	}
+	if hasPendingOperation {
+		e.persist()
+		e.mu.Lock()
+		e.health.LastCycle = now
+		e.health.Status = "degraded"
+		e.health.LastError = e.riskIncreaseBlockReason(now, markets)
+		e.refreshHealthLocked(markets)
+		e.mu.Unlock()
 		return
 	}
 	e.manageExisting(ctx, now, markets)
@@ -450,6 +529,9 @@ func (e *Engine) runCycle(ctx context.Context) {
 			e.nextChainScan = time.Now().Add(time.Duration(e.cfg.Strategy.ChainQuoteRefreshMinutes) * time.Minute)
 		}
 		ranked := rankOpportunities(opps)
+		if scanErr == nil && len(e.state.PendingOperations) == 0 {
+			e.manageSpreadProfitRotations(ctx, now, markets, ranked)
+		}
 		e.rebalance(ctx, now, markets, ranked)
 		e.mu.Lock()
 		e.opportunities = ranked
@@ -474,6 +556,25 @@ func (e *Engine) runCycle(ctx context.Context) {
 	e.mu.Unlock()
 }
 
+func (e *Engine) refreshTradingMetadata(ctx context.Context) error {
+	symbols, err := e.binance.Symbols(ctx)
+	if err != nil {
+		return err
+	}
+	intervals, err := e.binance.FundingIntervals(ctx)
+	if err != nil {
+		return err
+	}
+	for symbol := range e.state.Positions {
+		if _, ok := symbols[symbol]; !ok {
+			return fmt.Errorf("open position %s disappeared from Binance trading rules", symbol)
+		}
+	}
+	e.symbols = symbols
+	e.fundingHours = intervals
+	return nil
+}
+
 func (e *Engine) pauseForBinanceRateLimit(now time.Time) bool {
 	until := e.binance.RateLimitUntil()
 	if !until.After(now) {
@@ -494,6 +595,51 @@ func (e *Engine) resetDaily(now time.Time) {
 		e.state.DailyDate = d
 		e.state.DailyRealizedPnL = 0
 	}
+}
+
+func (e *Engine) riskIncreaseBlockReason(now time.Time, markets map[string]FundingMarket) string {
+	if len(e.state.PendingOperations) > 0 {
+		return fmt.Sprintf("%d pending operation(s) require reconciliation", len(e.state.PendingOperations))
+	}
+	if e.cfg.Mode == "live" && !e.accountReconciled {
+		if e.reconciliationError != "" {
+			return "account reconciliation failed: " + e.reconciliationError
+		}
+		return "account reconciliation has not completed"
+	}
+	if e.cfg.Risk.MaxDailyLossUSDT > 0 && e.state.DailyRealizedPnL <= -e.cfg.Risk.MaxDailyLossUSDT {
+		return fmt.Sprintf("daily loss %.2f reached limit %.2f USDT", -e.state.DailyRealizedPnL, e.cfg.Risk.MaxDailyLossUSDT)
+	}
+	if e.cfg.Mode == "live" && e.entryRiskPaused {
+		return "live account risk is unavailable or above the entry limit"
+	}
+	maxAge := time.Duration(e.cfg.Risk.MaxDataAgeSeconds) * time.Second
+	for symbol := range e.state.Positions {
+		market, ok := markets[symbol]
+		if !ok || market.UpdatedAt.IsZero() || now.Sub(market.UpdatedAt) > maxAge {
+			return fmt.Sprintf("missing or stale market for open position %s", symbol)
+		}
+	}
+	return ""
+}
+
+func (e *Engine) availableEntryNotional() float64 {
+	if e.cfg.Mode != "live" {
+		committed := 0.0
+		for _, p := range e.state.Positions {
+			committed += p.SpotCostUSDT
+		}
+		return math.Max(0, e.cfg.Risk.TotalCapitalUSDT-committed)
+	}
+	committed := 0.0
+	for _, p := range e.state.Positions {
+		committed += p.SpotCostUSDT
+	}
+	configuredRemaining := math.Max(0, e.cfg.Risk.TotalCapitalUSDT-committed)
+	spotCapacity := math.Max(0, e.chainAvailableUSDT-e.cfg.Risk.MinBSCUSDTReserve)
+	leverage := math.Max(1, float64(e.cfg.Binance.Leverage))
+	futuresCapacity := math.Max(0, e.accountRisk.AvailableBalance*leverage*e.cfg.Risk.MaxFuturesMarginUsePercent/100)
+	return math.Min(configuredRemaining, math.Min(spotCapacity, futuresCapacity))
 }
 
 func (e *Engine) updateFunding(ctx context.Context, markets map[string]FundingMarket) error {
@@ -517,7 +663,7 @@ func (e *Engine) updateFunding(ctx context.Context, markets map[string]FundingMa
 			if len(history) > 0 {
 				start = history[len(history)-1].Time.Add(time.Millisecond)
 			}
-			records, err := e.binance.FundingHistory(ctx, symbol, start, 1000)
+			records, err := e.fetchFundingHistory(ctx, symbol, start)
 			if err != nil {
 				var rateLimit *BinanceRateLimitError
 				if errors.As(err, &rateLimit) {
@@ -547,6 +693,29 @@ func (e *Engine) updateFunding(ctx context.Context, markets map[string]FundingMa
 	return nil
 }
 
+func (e *Engine) fetchFundingHistory(ctx context.Context, symbol string, start time.Time) ([]FundingRecord, error) {
+	const pageSize = 1000
+	const maxPages = 10
+	cursor := start
+	all := make([]FundingRecord, 0, pageSize)
+	for page := 0; page < maxPages; page++ {
+		records, err := e.binance.FundingHistory(ctx, symbol, cursor, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(records) == 0 {
+			break
+		}
+		all = append(all, records...)
+		latest := records[len(records)-1].Time
+		if len(records) < pageSize || latest.IsZero() || !latest.After(cursor) {
+			break
+		}
+		cursor = latest.Add(time.Millisecond)
+	}
+	return all, nil
+}
+
 func (e *Engine) manageLiquidationRisk(ctx context.Context, now time.Time) {
 	if e.cfg.Mode != "live" {
 		return
@@ -568,6 +737,12 @@ func (e *Engine) manageLiquidationRisk(ctx context.Context, now time.Time) {
 	e.accountRisk = account
 	e.positionRisks = risks
 	e.entryRiskPaused = account.MarginRatioPercent >= e.cfg.Risk.AccountMarginStopEntryPercent
+	if balance, balanceErr := e.chain.Balance(ctx, e.cfg.BSC.USDTAddress, e.cfg.BSC.USDTDecimals); balanceErr != nil {
+		e.entryRiskPaused = true
+		e.fail(ctx, "bsc-usdt-balance", balanceErr)
+	} else {
+		e.chainAvailableUSDT = balance
+	}
 
 	accountBreached := account.MarginRatioPercent >= e.cfg.Risk.AccountMarginReducePercent
 	var accountConfirmed bool
@@ -581,7 +756,8 @@ func (e *Engine) manageLiquidationRisk(ctx context.Context, now time.Time) {
 	hasEmergency := accountEmergency
 	for symbol := range e.state.Positions {
 		risk, ok := risks[symbol]
-		if !ok {
+		if !ok || risk.PositionAmount >= 0 {
+			e.entryRiskPaused = true
 			e.fail(ctx, "position-risk-"+symbol, fmt.Errorf("live Binance position is missing"))
 			continue
 		}
@@ -663,7 +839,10 @@ func (e *Engine) manageExisting(ctx context.Context, now time.Time, markets map[
 			p.LastFundingAssessmentTime = stats.LastSettlementTime
 		}
 		if e.state.WeakFundingSettlements[symbol] >= e.cfg.Strategy.WeakFundingSettlements && now.Sub(p.OpenedAt).Hours() >= e.cfg.Strategy.MinPositionAgeHours {
+			e.setPositionDecision(symbol, "资金费持续偏弱，等待更高净收益候选")
 			slog.Info("funding persistently weak; position eligible for replacement", "symbol", symbol, "weak_settlements", e.state.WeakFundingSettlements[symbol])
+		} else if strings.HasPrefix(e.positionDecisions[symbol], "资金费持续偏弱") || e.positionDecisions[symbol] == "" {
+			e.setPositionDecision(symbol, "继续持有并收取资金费")
 		}
 	}
 }
@@ -675,12 +854,15 @@ func (e *Engine) manageDepthSpreadAndHedge(ctx context.Context, now time.Time, m
 		EmergencyShortfallPercent: e.cfg.Risk.DepthEmergencyShortfallPct,
 	}
 	for symbol, p := range e.state.Positions {
+		if len(e.state.PendingOperations) > 0 {
+			return
+		}
 		m, ok := markets[symbol]
 		if !ok {
 			continue
 		}
-		t, tokenAvailable := e.tokens[symbol]
-		if !tokenAvailable || !addressPattern.MatchString(t.BSCAddress) {
+		t, err := e.positionToken(p)
+		if err != nil {
 			slog.Warn("position chain checks skipped; token configuration unavailable", "symbol", symbol, "address", p.TokenAddress)
 			continue
 		}
@@ -712,6 +894,29 @@ func (e *Engine) manageDepthSpreadAndHedge(ctx context.Context, now time.Time, m
 		}
 		if err := e.correctHedgeDrift(ctx, p); err != nil {
 			e.fail(ctx, "hedge-drift-"+symbol, err)
+			if len(e.state.PendingOperations) > 0 {
+				return
+			}
+		}
+	}
+}
+
+func (e *Engine) manageSpreadProfitRotations(ctx context.Context, now time.Time, markets map[string]FundingMarket, opps []Opportunity) {
+	if e.cfg.Mode == "monitor" || e.riskIncreaseBlockReason(now, markets) != "" {
+		return
+	}
+	for symbol, p := range e.state.Positions {
+		if e.riskIncreaseBlockReason(time.Now(), markets) != "" {
+			return
+		}
+		m, ok := markets[symbol]
+		if !ok || m.MarkPrice <= 0 || m.UpdatedAt.IsZero() || now.Sub(m.UpdatedAt) > time.Duration(e.cfg.Risk.MaxDataAgeSeconds)*time.Second {
+			continue
+		}
+		t, err := e.positionToken(p)
+		if err != nil {
+			e.fail(ctx, "spread-token-"+symbol, err)
+			continue
 		}
 		exitUSDT, err := e.chain.SellQuote(ctx, t, p.TokenQty)
 		if err != nil {
@@ -722,17 +927,40 @@ func (e *Engine) manageDepthSpreadAndHedge(ctx context.Context, now time.Time, m
 		futuresFees := p.ShortQty * (p.ShortEntryPrice + m.MarkPrice) * e.cfg.Binance.TakerFeeBPS / 10000
 		net := exitUSDT - p.SpotCostUSDT + shortPnL + p.FundingAccruedUSDT - futuresFees - e.cfg.BSC.GasReserveUSDT
 		gross := p.SpotCostUSDT + p.ShortQty*p.ShortEntryPrice
-		returnBPS := 0.0
-		if gross > 0 {
-			returnBPS = net / gross * 10000
+		if gross <= 0 || net < e.cfg.Strategy.MinPriceArbNetUSDT || net/gross*10000 < e.cfg.Strategy.PriceSpreadTakeProfitBPS {
+			continue
 		}
-		if net >= e.cfg.Strategy.MinPriceArbNetUSDT && returnBPS >= e.cfg.Strategy.PriceSpreadTakeProfitBPS {
-			if err := e.closePosition(ctx, p, m, "price_spread_take_profit"); err != nil {
-				e.fail(ctx, "spread-close-"+symbol, err)
-			} else {
-				e.state.CooldownUntil[symbol] = now.Add(time.Duration(e.cfg.Strategy.PriceArbCooldownHours * float64(time.Hour)))
+		currentAPR := e.state.FundingStats[symbol].ConservativeAPRPercent
+		var destination Opportunity
+		for _, candidate := range opps {
+			if _, held := e.state.Positions[candidate.Symbol]; held {
+				continue
+			}
+			if now.Before(e.state.CooldownUntil[candidate.Symbol]) || e.state.EntryConfirmations[candidate.Symbol] < e.cfg.Strategy.EntryConfirmationScans {
+				continue
+			}
+			if betterDestinationForProfitExit(*p, p.ShortQty*m.MarkPrice, currentAPR, candidate, e.cfg) && (destination.Symbol == "" || candidate.ExpectedHoldProfit > destination.ExpectedHoldProfit) {
+				destination = candidate
 			}
 		}
+		if destination.Symbol == "" {
+			e.setPositionDecision(symbol, "价差已盈利，但暂无更高净收益去处，继续持有")
+			slog.Info("profitable position retained; no better confirmed destination", "symbol", symbol, "exit_pnl_usdt", net, "funding_apr_percent", currentAPR)
+			continue
+		}
+		if err := e.closePosition(ctx, p, m, "price_spread_profit_rotation"); err != nil {
+			e.fail(ctx, "spread-close-"+symbol, err)
+			continue
+		}
+		e.state.CooldownUntil[symbol] = now.Add(time.Duration(e.cfg.Strategy.PriceArbCooldownHours * float64(time.Hour)))
+		if reason := e.riskIncreaseBlockReason(time.Now(), markets); reason != "" {
+			slog.Warn("profit rotation entry blocked after close", "symbol", destination.Symbol, "reason", reason)
+			return
+		}
+		if err := e.openPosition(ctx, destination, "price_spread_profit_rotation"); err != nil {
+			e.fail(ctx, "spread-open-"+destination.Symbol, err)
+		}
+		return
 	}
 }
 
@@ -756,21 +984,52 @@ func (e *Engine) correctHedgeDrift(ctx context.Context, p *Position) error {
 	if delta < rule.MinQty || delta <= 0 {
 		return fmt.Errorf("%s hedge drift is above limit but %.8f is below minimum order", p.Symbol, delta)
 	}
+	token, err := e.positionToken(p)
+	if err != nil {
+		return err
+	}
+	op, err := e.beginOperation("hedge", p.Symbol, "hedge_drift", token)
+	if err != nil {
+		return err
+	}
+	op.OriginalTokenQty = p.TokenQty
+	op.OriginalShortQty = p.ShortQty
+	op.PlannedFuturesQty = delta
+	op.BinanceSide = "SELL"
+	reduceOnly := false
 	if p.TokenQty > p.ShortQty {
-		fill, err := e.binance.MarketOrder(ctx, p.Symbol, "SELL", delta, false)
-		if err != nil {
-			return err
-		}
+		op.BinanceSide = "SELL"
+	} else {
+		op.BinanceSide = "BUY"
+		reduceOnly = true
+	}
+	if err := e.updateOperation(op, "futures_submitting", nil); err != nil {
+		return err
+	}
+	fill, err := e.submitTrackedMarketOrder(ctx, op, "futures-hedge", op.BinanceSide, delta, reduceOnly)
+	if err != nil {
+		_ = e.updateOperation(op, "futures_status_unknown", err)
+		return err
+	}
+	if op.BinanceSide == "SELL" {
 		p.ShortQty += fill.ExecutedQty
 	} else {
-		fill, err := e.binance.MarketOrder(ctx, p.Symbol, "BUY", delta, true)
-		if err != nil {
-			return err
-		}
-		p.ShortQty -= fill.ExecutedQty
+		p.ShortQty = math.Max(0, p.ShortQty-fill.ExecutedQty)
 	}
 	p.LastAdjustedAt = time.Now()
-	return appendLedger(e.cfg.StateDir, map[string]any{"time": time.Now(), "event": "hedge_correction", "symbol": p.Symbol, "token_qty": p.TokenQty, "short_qty": p.ShortQty})
+	if err := e.updateOperation(op, "completed", nil); err != nil {
+		return err
+	}
+	if err := appendLedger(e.cfg.StateDir, map[string]any{"time": time.Now(), "event": "hedge_correction", "symbol": p.Symbol, "token_qty": p.TokenQty, "short_qty": p.ShortQty, "executed_qty": fill.ExecutedQty}); err != nil {
+		return err
+	}
+	drift = abs(p.TokenQty-p.ShortQty) / math.Max(p.TokenQty, p.ShortQty) * 100
+	if drift > e.cfg.Risk.MaxHedgeDriftPercent {
+		err := fmt.Errorf("%s hedge correction partially filled; drift remains %.2f%%", p.Symbol, drift)
+		_ = e.updateOperation(op, "manual_reconciliation_required", err)
+		return err
+	}
+	return e.finishOperation(op)
 }
 
 func (e *Engine) accrueFunding(p *Position, m FundingMarket, now time.Time) {
@@ -791,6 +1050,7 @@ func (e *Engine) accrueFunding(p *Position, m FundingMarket, now time.Time) {
 }
 
 func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]FundingMarket) ([]Opportunity, error) {
+	now := time.Now()
 	type candidate struct {
 		token  TokenConfig
 		market FundingMarket
@@ -803,7 +1063,7 @@ func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]Fundi
 	var candidates []candidate
 	for symbol, token := range e.tokens {
 		m, ok := markets[symbol]
-		if !ok || m.FundingRate*10000 < e.cfg.Strategy.MinCurrentFundingBPS {
+		if !ok || m.UpdatedAt.IsZero() || now.Sub(m.UpdatedAt) > time.Duration(e.cfg.Risk.MaxDataAgeSeconds)*time.Second || m.FundingRate*10000 < e.cfg.Strategy.MinCurrentFundingBPS {
 			continue
 		}
 		stats := e.state.FundingStats[token.BinanceSymbol]
@@ -858,26 +1118,25 @@ func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]Fundi
 				results <- result{err: fmt.Errorf("%s BSC spot price %.8f does not match Binance mark price %.8f", t.Symbol, q.BuyPrice, market.MarkPrice)}
 				return
 			}
+			basisBPS := (q.BuyPrice/market.MarkPrice - 1) * 10000
+			if math.Abs(basisBPS) > e.cfg.Strategy.MaxEntryBasisBPS {
+				results <- result{err: fmt.Errorf("%s entry basis %.2f bps exceeds %.2f bps limit", t.Symbol, basisBPS, e.cfg.Strategy.MaxEntryBasisBPS)}
+				return
+			}
 			chainLoss := target * q.RoundTripLossBPS / 10000
 			binanceFees := target * 2 * e.cfg.Binance.TakerFeeBPS / 10000
-			roundTrip := chainLoss + binanceFees + e.cfg.BSC.GasReserveUSDT
+			economics := calculateEntryEconomics(target, apr, e.cfg.Strategy.EvaluationHoldHours, chainLoss, binanceFees, e.cfg.BSC.GasReserveUSDT, basisBPS)
 			grossAnnual := target * apr / 100
-			payback := math.Inf(1)
-			if grossAnnual > 0 {
-				payback = roundTrip / (grossAnnual / 365)
-			}
 			holdGross := grossAnnual * e.cfg.Strategy.EvaluationHoldHours / (365 * 24)
-			expected := holdGross - roundTrip
-			netAPR := apr - roundTrip/target*(365*24/e.cfg.Strategy.EvaluationHoldHours)*100
 			costCoverage := 0.0
-			if roundTrip > 0 {
-				costCoverage = holdGross / roundTrip
+			if economics.RoundTripCostUSDT > 0 {
+				costCoverage = holdGross / economics.RoundTripCostUSDT
 			}
-			if apr < e.cfg.Strategy.MinFundingAPRPercent || payback > e.cfg.Strategy.MaxEntryPaybackDays || expected <= 0 || costCoverage < e.cfg.Strategy.MinCostCoverageRatio {
+			if apr < e.cfg.Strategy.MinFundingAPRPercent || economics.PaybackDays > e.cfg.Strategy.MaxEntryPaybackDays || economics.ExpectedHoldProfitUSDT <= 0 || costCoverage < e.cfg.Strategy.MinCostCoverageRatio {
 				return
 			}
 			stats := e.state.FundingStats[t.BinanceSymbol]
-			results <- result{o: Opportunity{Symbol: t.BinanceSymbol, FundingBPS: market.FundingRate * 10000, FundingAPRPercent: apr, Median7DAPRPercent: stats.Median7DAPRPercent, Median30DAPRPercent: stats.Median30DAPRPercent, PositiveFundingRate: stats.PositiveRatio, FundingSamples: stats.Samples, NetAPRPercent: netAPR, EntryCostUSDT: chainLoss/2 + target*e.cfg.Binance.TakerFeeBPS/10000 + e.cfg.BSC.GasReserveUSDT/2, RoundTripCostUSDT: roundTrip, ExpectedHoldProfit: expected, PaybackDays: payback, TargetNotionalUSDT: target, MaxSafeNotionalUSDT: safe, Chain: q, Market: market}}
+			results <- result{o: Opportunity{Symbol: t.BinanceSymbol, FundingBPS: market.FundingRate * 10000, FundingAPRPercent: apr, Median7DAPRPercent: stats.Median7DAPRPercent, Median30DAPRPercent: stats.Median30DAPRPercent, PositiveFundingRate: stats.PositiveRatio, FundingSamples: stats.Samples, NetAPRPercent: economics.NetAPRPercent, EntryCostUSDT: chainLoss/2 + target*e.cfg.Binance.TakerFeeBPS/10000 + e.cfg.BSC.GasReserveUSDT/2 + economics.BasisCostUSDT, EntryBasisBPS: basisBPS, BasisCostUSDT: economics.BasisCostUSDT, RoundTripCostUSDT: economics.RoundTripCostUSDT, ExpectedHoldProfit: economics.ExpectedHoldProfitUSDT, PaybackDays: economics.PaybackDays, TargetNotionalUSDT: target, MaxSafeNotionalUSDT: safe, Chain: q, Market: market}}
 		}(item.token, item.market, item.apr)
 	}
 	wg.Wait()
@@ -906,7 +1165,7 @@ func (e *Engine) intervalsPerYear(symbol string) float64 {
 }
 
 func (e *Engine) rebalance(ctx context.Context, now time.Time, markets map[string]FundingMarket, opps []Opportunity) {
-	if e.cfg.Mode == "monitor" || (e.cfg.Mode == "live" && e.entryRiskPaused) || (e.cfg.Risk.MaxDailyLossUSDT > 0 && e.state.DailyRealizedPnL <= -e.cfg.Risk.MaxDailyLossUSDT) {
+	if e.cfg.Mode == "monitor" || e.riskIncreaseBlockReason(now, markets) != "" {
 		return
 	}
 	bySymbol := map[string]Opportunity{}
@@ -925,6 +1184,9 @@ func (e *Engine) rebalance(ctx context.Context, now time.Time, markets map[strin
 	}
 	// Conservative replacement: weak settled funding, minimum age, APR advantage and full switching-cost benefit are all required.
 	for symbol, p := range e.state.Positions {
+		if e.riskIncreaseBlockReason(time.Now(), markets) != "" {
+			return
+		}
 		if e.state.WeakFundingSettlements[symbol] < e.cfg.Strategy.WeakFundingSettlements {
 			continue
 		}
@@ -933,6 +1195,7 @@ func (e *Engine) rebalance(ctx context.Context, now time.Time, markets map[strin
 			stats := e.state.FundingStats[symbol]
 			current = Opportunity{Symbol: symbol, FundingAPRPercent: stats.ConservativeAPRPercent, NetAPRPercent: stats.ConservativeAPRPercent}
 		}
+		var destination Opportunity
 		for _, candidate := range opps {
 			if _, held := e.state.Positions[candidate.Symbol]; held {
 				continue
@@ -943,20 +1206,31 @@ func (e *Engine) rebalance(ctx context.Context, now time.Time, markets map[strin
 			if e.state.EntryConfirmations[candidate.Symbol] < e.cfg.Strategy.EntryConfirmationScans {
 				continue
 			}
-			if shouldSwitch(current, candidate, *p, e.cfg, now) {
-				if err := e.closePosition(ctx, p, markets[symbol], "funding_rebalance"); err != nil {
-					e.fail(ctx, "rebalance-close-"+symbol, err)
-				} else if err := e.openPosition(ctx, candidate, "funding_rebalance"); err != nil {
-					e.fail(ctx, "rebalance-open-"+candidate.Symbol, err)
-				}
-				break
+			if shouldSwitch(current, candidate, *p, e.cfg, now) && (destination.Symbol == "" || candidate.ExpectedHoldProfit > destination.ExpectedHoldProfit) {
+				destination = candidate
 			}
 		}
+		if destination.Symbol == "" {
+			e.setPositionDecision(symbol, "资金费持续偏弱，但暂无更高净收益候选，继续持有")
+			slog.Info("weak-funding position retained; no better confirmed destination", "symbol", symbol, "weak_settlements", e.state.WeakFundingSettlements[symbol], "funding_apr_percent", current.FundingAPRPercent)
+			continue
+		}
+		if err := e.closePosition(ctx, p, markets[symbol], "funding_rebalance"); err != nil {
+			e.fail(ctx, "rebalance-close-"+symbol, err)
+		} else if reason := e.riskIncreaseBlockReason(time.Now(), markets); reason != "" {
+			slog.Warn("replacement entry blocked after close", "symbol", destination.Symbol, "reason", reason)
+		} else if err := e.openPosition(ctx, destination, "funding_rebalance"); err != nil {
+			e.fail(ctx, "rebalance-open-"+destination.Symbol, err)
+		}
+		return
 	}
 	if len(e.state.Positions) >= e.cfg.Strategy.TargetPositions {
 		return
 	}
 	for _, o := range opps {
+		if e.riskIncreaseBlockReason(time.Now(), markets) != "" {
+			return
+		}
 		if len(e.state.Positions) >= e.cfg.Strategy.TargetPositions {
 			break
 		}
@@ -980,50 +1254,118 @@ func (e *Engine) openPosition(ctx context.Context, o Opportunity, reason string)
 	qty := o.Chain.OutputTokens
 	shortQtyState := qty
 	shortPrice := o.Market.MarkPrice
+	var op *PendingOperation
+	operationComplete := true
 	if e.cfg.Mode == "live" {
+		if available := e.availableEntryNotional(); o.TargetNotionalUSDT > available+1e-9 {
+			return fmt.Errorf("entry requires %.2f USDT per leg but only %.2f USDT risk-adjusted capacity remains", o.TargetNotionalUSDT, available)
+		}
 		before, err := e.chain.Balance(ctx, t.BSCAddress, t.Decimals)
 		if err != nil {
 			return err
 		}
-		_, tx, err := e.chain.SwapExactInput(ctx, e.cfg.BSC.USDTAddress, t.BSCAddress, e.cfg.BSC.USDTDecimals, t.Decimals, o.TargetNotionalUSDT, o.Chain.OutputTokens)
+		op, err = e.beginOperation("open", o.Symbol, reason, t)
 		if err != nil {
+			return err
+		}
+		op.BalanceBefore = before
+		op.PlannedTokenQty = o.Chain.OutputTokens
+		op.TargetNotionalUSDT = o.TargetNotionalUSDT
+		if err := e.updateOperation(op, "spot_submitting", nil); err != nil {
+			return err
+		}
+		recordBroadcast := func(hash common.Hash) error {
+			op.ChainTxHash = hash.Hex()
+			op.Stage = "spot_broadcast"
+			op.UpdatedAt = time.Now()
+			return saveState(e.cfg.StateDir, e.state)
+		}
+		_, tx, err := e.chain.SwapExactInputTracked(ctx, e.cfg.BSC.USDTAddress, t.BSCAddress, e.cfg.BSC.USDTDecimals, t.Decimals, o.TargetNotionalUSDT, o.Chain.OutputTokens, recordBroadcast)
+		if err != nil {
+			if tx != (common.Hash{}) {
+				op.ChainTxHash = tx.Hex()
+				_ = e.alert.Send(ctx, "chain-status-"+o.Symbol, "CRITICAL", fmt.Sprintf("%s opening BSC transaction %s was broadcast but its final status is unknown; all new risk is locked", o.Symbol, tx.Hex()))
+			}
+			_ = e.updateOperation(op, "spot_status_unknown", err)
+			return err
+		}
+		op.ChainTxHash = tx.Hex()
+		if err := e.updateOperation(op, "spot_confirmed", nil); err != nil {
 			return err
 		}
 		after, err := e.chain.Balance(ctx, t.BSCAddress, t.Decimals)
 		if err != nil {
+			_ = e.updateOperation(op, "spot_balance_unknown", err)
 			return fmt.Errorf("spot bought in %s but balance reconciliation failed: %w", tx, err)
 		}
 		qty = after - before
+		op.BalanceAfter = after
+		op.PlannedTokenQty = qty
 		if qty <= 0 {
-			return fmt.Errorf("spot buy %s produced no token balance increase", tx)
+			err := fmt.Errorf("spot buy %s produced no token balance increase", tx)
+			_ = e.updateOperation(op, "spot_balance_unknown", err)
+			return err
 		}
 		if err := e.binance.ConfigureSymbol(ctx, o.Symbol); err != nil {
-			_ = e.emergencySellSpot(ctx, t, qty)
+			rollback := e.emergencySellSpotTracked(ctx, op, t, qty)
+			if rollback == nil {
+				_ = e.finishOperation(op)
+			} else {
+				_ = e.updateOperation(op, "manual_reconciliation_required", fmt.Errorf("configure futures failed: %v; spot rollback failed: %w", err, rollback))
+			}
 			return err
 		}
 		rule := e.symbols[o.Symbol]
 		shortQty := floorStep(qty, rule.StepSize)
-		fill, err := e.binance.MarketOrder(ctx, o.Symbol, "SELL", shortQty, false)
+		op.PlannedFuturesQty = shortQty
+		if err := e.updateOperation(op, "futures_submitting", nil); err != nil {
+			return err
+		}
+		fill, err := e.submitTrackedMarketOrder(ctx, op, "futures-open", "SELL", shortQty, false)
 		if err != nil {
-			rollback := e.emergencySellSpot(ctx, t, qty)
-			return fmt.Errorf("second leg failed: %w; spot rollback: %v", err, rollback)
+			_ = e.updateOperation(op, "futures_status_unknown", err)
+			return fmt.Errorf("second leg status is unknown; operation locked for reconciliation: %w", err)
 		}
 		shortQtyState = fill.ExecutedQty
 		shortPrice = fill.AvgPrice
+		op.FuturesFilledQty = fill.ExecutedQty
+		if fill.ExecutedQty+rule.StepSize/2 < shortQty {
+			operationComplete = false
+			_ = e.updateOperation(op, "manual_reconciliation_required", fmt.Errorf("Binance opening short partially filled %.8f of %.8f", fill.ExecutedQty, shortQty))
+		} else {
+			if err := e.updateOperation(op, "hedged", nil); err != nil {
+				return err
+			}
+		}
 	}
 	now := time.Now()
 	p := &Position{Symbol: o.Symbol, TokenAddress: t.BSCAddress, TokenDecimals: t.Decimals, TokenQty: qty, SpotCostUSDT: o.TargetNotionalUSDT, ShortQty: shortQtyState, ShortEntryPrice: shortPrice, OpenedAt: now, LastAdjustedAt: now, LastFundingTime: now}
 	e.state.Positions[o.Symbol] = p
+	e.setPositionDecision(o.Symbol, "继续持有并收取资金费")
+	if e.cfg.Mode == "live" {
+		e.chainAvailableUSDT = math.Max(0, e.chainAvailableUSDT-o.TargetNotionalUSDT)
+		e.accountRisk.AvailableBalance = math.Max(0, e.accountRisk.AvailableBalance-o.TargetNotionalUSDT/float64(e.cfg.Binance.Leverage))
+	}
+	if op != nil && operationComplete {
+		if err := e.finishOperation(op); err != nil {
+			return err
+		}
+	} else if op != nil {
+		e.persist()
+	}
 	delete(e.state.EntryConfirmations, o.Symbol)
 	event := map[string]any{"time": now, "event": "open", "mode": e.cfg.Mode, "symbol": o.Symbol, "reason": reason, "notional_usdt": o.TargetNotionalUSDT, "token_qty": qty, "short_price": shortPrice, "funding_apr_percent": o.FundingAPRPercent, "estimated_round_trip_cost_usdt": o.RoundTripCostUSDT}
 	_ = appendLedger(e.cfg.StateDir, event)
+	if !operationComplete {
+		return fmt.Errorf("%s opened with a partial futures hedge; new risk is locked for reconciliation", o.Symbol)
+	}
 	_ = e.alert.Send(ctx, "open-"+o.Symbol, "INFO", fmt.Sprintf("opened %s %.2f USDT hedge, funding APR %.1f%%", o.Symbol, o.TargetNotionalUSDT, o.FundingAPRPercent))
 	return nil
 }
 
 func (e *Engine) closePosition(ctx context.Context, p *Position, market FundingMarket, reason string) error {
-	t, ok := e.tokens[p.Symbol]
-	if !ok || !addressPattern.MatchString(t.BSCAddress) {
+	t, err := e.positionToken(p)
+	if err != nil {
 		return fmt.Errorf("position %s token configuration is unavailable", p.Symbol)
 	}
 	exitUSDT := p.TokenQty * market.IndexPrice
@@ -1031,25 +1373,33 @@ func (e *Engine) closePosition(ctx context.Context, p *Position, market FundingM
 		exitUSDT = quoted
 	}
 	if e.cfg.Mode == "live" {
-		rule := e.symbols[p.Symbol]
-		closeQty := floorStep(p.ShortQty, rule.StepSize)
-		if _, err := e.binance.MarketOrder(ctx, p.Symbol, "BUY", closeQty, true); err != nil {
+		actualFraction, quoted, err := e.executeLiveReduction(ctx, p, t, 1, reason)
+		if err != nil {
 			return err
 		}
-		quoted, err := e.chain.SellQuote(ctx, t, p.TokenQty)
-		if err != nil {
-			return fmt.Errorf("futures closed but spot exit quote failed: %w", err)
-		}
-		if _, _, err := e.chain.SwapExactInput(ctx, t.BSCAddress, e.cfg.BSC.USDTAddress, t.Decimals, e.cfg.BSC.USDTDecimals, p.TokenQty, quoted); err != nil {
-			return fmt.Errorf("futures closed but spot exit failed: %w", err)
-		}
 		exitUSDT = quoted
+		if actualFraction < .999 {
+			closedFuturesNotional := p.ShortQty * actualFraction * market.MarkPrice
+			pnl, funding, fees := partialReductionPnL(*p, actualFraction, exitUSDT, market.MarkPrice, e.cfg.Binance.TakerFeeBPS, e.cfg.BSC.GasReserveUSDT)
+			e.state.DailyRealizedPnL += pnl
+			p.RealizedPnLUSDT += pnl
+			p.TokenQty *= 1 - actualFraction
+			p.ShortQty *= 1 - actualFraction
+			p.SpotCostUSDT *= 1 - actualFraction
+			p.FundingAccruedUSDT *= 1 - actualFraction
+			p.LastAdjustedAt = time.Now()
+			e.releaseEntryCapacity(exitUSDT, closedFuturesNotional)
+			_ = appendLedger(e.cfg.StateDir, map[string]any{"time": time.Now(), "event": "reduce", "mode": e.cfg.Mode, "symbol": p.Symbol, "fraction": actualFraction, "reason": reason + "_partial_fill", "pnl_usdt": pnl, "funding_usdt": funding, "fees_and_gas_estimate_usdt": fees})
+			return fmt.Errorf("Binance close partially filled %.2f%%; position retained with actual remaining quantities", actualFraction*100)
+		}
 	}
 	shortPnL := p.ShortQty * (p.ShortEntryPrice - market.MarkPrice)
 	fees := (p.ShortQty*p.ShortEntryPrice+p.ShortQty*market.MarkPrice)*e.cfg.Binance.TakerFeeBPS/10000 + e.cfg.BSC.GasReserveUSDT
 	pnl := exitUSDT - p.SpotCostUSDT + shortPnL + p.FundingAccruedUSDT - fees
+	e.releaseEntryCapacity(exitUSDT, p.ShortQty*market.MarkPrice)
 	e.state.DailyRealizedPnL += pnl
 	delete(e.state.Positions, p.Symbol)
+	delete(e.positionDecisions, p.Symbol)
 	delete(e.state.WeakFundingScans, p.Symbol)
 	delete(e.state.WeakFundingSettlements, p.Symbol)
 	delete(e.state.LiquidationBreachScans, p.Symbol)
@@ -1073,25 +1423,19 @@ func (e *Engine) reducePosition(ctx context.Context, p *Position, fraction float
 	}
 	// Live partial reduction closes the liquid futures leg first, then removes the matching spot quantity.
 	// Paper mode uses the same executable sell quote and cost model so its PnL is not understated.
-	t, ok := e.tokens[p.Symbol]
-	if !ok || !addressPattern.MatchString(t.BSCAddress) {
+	t, err := e.positionToken(p)
+	if err != nil {
 		return fmt.Errorf("position %s token configuration is unavailable", p.Symbol)
 	}
 	reduceQty := p.TokenQty * fraction
 	exitUSDT := 0.0
 	if e.cfg.Mode == "live" {
-		rule := e.symbols[p.Symbol]
-		q := floorStep(p.ShortQty*fraction, rule.StepSize)
-		if _, err := e.binance.MarketOrder(ctx, p.Symbol, "BUY", q, true); err != nil {
-			return err
-		}
-		quoted, err := e.chain.SellQuote(ctx, t, reduceQty)
+		actualFraction, quoted, err := e.executeLiveReduction(ctx, p, t, fraction, reason)
 		if err != nil {
 			return err
 		}
-		if _, _, err := e.chain.SwapExactInput(ctx, t.BSCAddress, e.cfg.BSC.USDTAddress, t.Decimals, e.cfg.BSC.USDTDecimals, reduceQty, quoted); err != nil {
-			return err
-		}
+		fraction = actualFraction
+		reduceQty = p.TokenQty * fraction
 		exitUSDT = quoted
 	} else {
 		quoted, err := e.chain.SellQuote(ctx, t, reduceQty)
@@ -1105,6 +1449,7 @@ func (e *Engine) reducePosition(ctx context.Context, p *Position, fraction float
 		markPrice = market.MarkPrice
 	}
 	pnl, funding, fees := partialReductionPnL(*p, fraction, exitUSDT, markPrice, e.cfg.Binance.TakerFeeBPS, e.cfg.BSC.GasReserveUSDT)
+	closedFuturesNotional := p.ShortQty * fraction * markPrice
 	e.state.DailyRealizedPnL += pnl
 	p.RealizedPnLUSDT += pnl
 	p.TokenQty *= 1 - fraction
@@ -1112,17 +1457,25 @@ func (e *Engine) reducePosition(ctx context.Context, p *Position, fraction float
 	p.SpotCostUSDT *= 1 - fraction
 	p.FundingAccruedUSDT *= 1 - fraction
 	p.LastAdjustedAt = time.Now()
+	e.releaseEntryCapacity(exitUSDT, closedFuturesNotional)
 	_ = appendLedger(e.cfg.StateDir, map[string]any{"time": time.Now(), "event": "reduce", "mode": e.cfg.Mode, "symbol": p.Symbol, "fraction": fraction, "reason": reason, "pnl_usdt": pnl, "funding_usdt": funding, "fees_and_gas_estimate_usdt": fees})
 	return nil
 }
 
-func (e *Engine) emergencySellSpot(ctx context.Context, t TokenConfig, qty float64) error {
-	quoted, err := e.chain.SellQuote(ctx, t, qty)
-	if err != nil {
-		return err
+func (e *Engine) releaseEntryCapacity(spotUSDT, futuresNotional float64) {
+	if e.cfg.Mode != "live" {
+		return
 	}
-	_, _, err = e.chain.SwapExactInput(ctx, t.BSCAddress, e.cfg.BSC.USDTAddress, t.Decimals, e.cfg.BSC.USDTDecimals, qty, quoted)
-	return err
+	e.chainAvailableUSDT += math.Max(0, spotUSDT)
+	leverage := math.Max(1, float64(e.cfg.Binance.Leverage))
+	e.accountRisk.AvailableBalance += math.Max(0, futuresNotional) / leverage
+}
+
+func (e *Engine) setPositionDecision(symbol, decision string) {
+	if e.positionDecisions == nil {
+		e.positionDecisions = map[string]string{}
+	}
+	e.positionDecisions[symbol] = decision
 }
 
 func (e *Engine) fail(ctx context.Context, key string, err error) {
@@ -1157,7 +1510,14 @@ func (e *Engine) refreshHealthLocked(markets map[string]FundingMarket) {
 	e.health.AccountMarginRatio = e.accountRisk.MarginRatioPercent
 	e.health.AccountMarginBalance = e.accountRisk.TotalMarginBalance
 	e.health.AccountAvailableBalance = e.accountRisk.AvailableBalance
+	e.health.BSCUSDTAvailable = e.chainAvailableUSDT
+	e.health.AvailableEntryNotional = e.availableEntryNotional()
 	e.health.EntryPausedByMargin = e.entryRiskPaused
+	e.health.RiskBlockReason = e.riskIncreaseBlockReason(time.Now(), markets)
+	e.health.RiskIncreaseBlocked = e.health.RiskBlockReason != ""
+	e.health.PendingOperations = len(e.state.PendingOperations)
+	e.health.AccountReconciled = e.accountReconciled
+	e.health.ReconciliationError = e.reconciliationError
 	e.health.RiskReduceCooldownUntil = e.state.RiskReduceCooldownUntil
 	e.health.Portfolio = map[string]PositionView{}
 	for symbol, p := range e.state.Positions {
@@ -1176,7 +1536,11 @@ func (e *Engine) refreshHealthLocked(markets map[string]FundingMarket) {
 				liquidationDistance = 0
 			}
 		}
-		e.health.Portfolio[symbol] = PositionView{Symbol: symbol, NotionalUSDT: (spot + short) / 2, FundingAccruedUSDT: p.FundingAccruedUSDT, FundingAPRPercent: stats.ConservativeAPRPercent, Median30DAPRPercent: stats.Median30DAPRPercent, PositiveFundingRatio: stats.PositiveRatio, WeakSettlements: e.state.WeakFundingSettlements[symbol], HedgeDriftPercent: drift, LiquidationDistanceX: liquidationDistance}
+		decision := e.positionDecisions[symbol]
+		if decision == "" {
+			decision = "继续持有并收取资金费"
+		}
+		e.health.Portfolio[symbol] = PositionView{Symbol: symbol, NotionalUSDT: (spot + short) / 2, FundingAccruedUSDT: p.FundingAccruedUSDT, FundingAPRPercent: stats.ConservativeAPRPercent, Median30DAPRPercent: stats.Median30DAPRPercent, PositiveFundingRatio: stats.PositiveRatio, WeakSettlements: e.state.WeakFundingSettlements[symbol], AllocationDecision: decision, HedgeDriftPercent: drift, LiquidationDistanceX: liquidationDistance}
 	}
 }
 
@@ -1204,6 +1568,17 @@ func (e *Engine) FundingWatch() []FundingWatch {
 
 func (e *Engine) Ledger(limit int) ([]map[string]any, error) {
 	return readLedger(e.cfg.StateDir, limit)
+}
+
+func (e *Engine) PendingOperations() []PendingOperation {
+	out := make([]PendingOperation, 0, len(e.state.PendingOperations))
+	for _, op := range e.state.PendingOperations {
+		if op != nil {
+			out = append(out, *op)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
 }
 
 func (e *Engine) PositionSymbols() []string {

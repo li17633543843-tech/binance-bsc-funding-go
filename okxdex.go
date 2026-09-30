@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -734,6 +735,14 @@ func (p *OKXDEXClient) swapData(ctx context.Context, tokenIn, tokenOut string, a
 }
 
 func (p *OKXDEXClient) SwapExactInput(ctx context.Context, tokenIn, tokenOut string, inDecimals, outDecimals uint8, amountInFloat, quotedOutFloat float64) (float64, common.Hash, error) {
+	return p.swapExactInput(ctx, tokenIn, tokenOut, inDecimals, outDecimals, amountInFloat, quotedOutFloat, nil)
+}
+
+func (p *OKXDEXClient) SwapExactInputTracked(ctx context.Context, tokenIn, tokenOut string, inDecimals, outDecimals uint8, amountInFloat, quotedOutFloat float64, onBroadcast func(common.Hash) error) (float64, common.Hash, error) {
+	return p.swapExactInput(ctx, tokenIn, tokenOut, inDecimals, outDecimals, amountInFloat, quotedOutFloat, onBroadcast)
+}
+
+func (p *OKXDEXClient) swapExactInput(ctx context.Context, tokenIn, tokenOut string, inDecimals, outDecimals uint8, amountInFloat, quotedOutFloat float64, onBroadcast func(common.Hash) error) (float64, common.Hash, error) {
 	if p.key == nil {
 		return 0, common.Hash{}, fmt.Errorf("BSC private key is missing")
 	}
@@ -778,62 +787,73 @@ func (p *OKXDEXClient) SwapExactInput(ctx context.Context, tokenIn, tokenOut str
 	if err != nil {
 		return 0, common.Hash{}, err
 	}
-	receipt, err := p.sendTransaction(ctx, common.HexToAddress(s.Tx.To), value, data, gas, gasPrice)
+	receipt, txHash, err := p.sendTransactionTracked(ctx, common.HexToAddress(s.Tx.To), value, data, gas, gasPrice, onBroadcast)
 	if err != nil {
-		return 0, common.Hash{}, err
+		return expected, txHash, err
 	}
 	return expected, receipt.TxHash, nil
 }
 
 func (p *OKXDEXClient) sendTransaction(ctx context.Context, to common.Address, value *big.Int, data []byte, gas uint64, gasPrice *big.Int) (*types.Receipt, error) {
+	receipt, _, err := p.sendTransactionTracked(ctx, to, value, data, gas, gasPrice, nil)
+	return receipt, err
+}
+
+func (p *OKXDEXClient) sendTransactionTracked(ctx context.Context, to common.Address, value *big.Int, data []byte, gas uint64, gasPrice *big.Int, onBroadcast func(common.Hash) error) (*types.Receipt, common.Hash, error) {
 	if p.key == nil {
-		return nil, fmt.Errorf("BSC private key is missing")
+		return nil, common.Hash{}, fmt.Errorf("BSC private key is missing")
 	}
 	if gas == 0 {
 		estimated, err := p.client.EstimateGas(ctx, ethereum.CallMsg{From: p.wallet, To: &to, Value: value, Data: data})
 		if err != nil {
-			return nil, err
+			return nil, common.Hash{}, err
 		}
 		gas = estimated
 	}
 	if gas > ^uint64(0)/3*2 {
-		return nil, fmt.Errorf("BSC gas limit overflow")
+		return nil, common.Hash{}, fmt.Errorf("BSC gas limit overflow")
 	}
 	gas = gas + gas/2
 	if gas > p.bsc.MaxGasLimit {
-		return nil, fmt.Errorf("BSC gas limit %d exceeds configured maximum %d", gas, p.bsc.MaxGasLimit)
+		return nil, common.Hash{}, fmt.Errorf("BSC gas limit %d exceeds configured maximum %d", gas, p.bsc.MaxGasLimit)
 	}
 	if gasPrice == nil || gasPrice.Sign() <= 0 {
 		var err error
 		gasPrice, err = p.client.SuggestGasPrice(ctx)
 		if err != nil {
-			return nil, err
+			return nil, common.Hash{}, err
 		}
 	}
 	if gasPrice.Cmp(units(p.bsc.MaxGasPriceGwei, 9)) > 0 {
-		return nil, fmt.Errorf("BSC gas price exceeds configured maximum %.4g gwei", p.bsc.MaxGasPriceGwei)
+		return nil, common.Hash{}, fmt.Errorf("BSC gas price exceeds configured maximum %.4g gwei", p.bsc.MaxGasPriceGwei)
 	}
 	nonce, err := p.client.PendingNonceAt(ctx, p.wallet)
 	if err != nil {
-		return nil, err
+		return nil, common.Hash{}, err
 	}
 	tx := types.NewTransaction(nonce, to, value, gas, gasPrice, data)
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(p.bsc.ChainID)), p.key)
 	if err != nil {
-		return nil, err
+		return nil, common.Hash{}, err
 	}
 	if err := p.client.SendTransaction(ctx, signed); err != nil {
-		return nil, err
+		return nil, common.Hash{}, err
+	}
+	txHash := signed.Hash()
+	if onBroadcast != nil {
+		if err := onBroadcast(txHash); err != nil {
+			return nil, txHash, fmt.Errorf("BSC transaction %s broadcast but journal persistence failed: %w", txHash, err)
+		}
 	}
 	receipt, err := bind.WaitMined(ctx, p.client, signed)
 	if err != nil {
-		return nil, err
+		return nil, txHash, err
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
-		return nil, fmt.Errorf("BSC transaction reverted: %s", signed.Hash())
+		return nil, txHash, fmt.Errorf("BSC transaction reverted: %s", signed.Hash())
 	}
 	if p.bsc.Confirmations <= 1 {
-		return receipt, nil
+		return receipt, txHash, nil
 	}
 	target := receipt.BlockNumber.Uint64() + p.bsc.Confirmations - 1
 	ticker := time.NewTicker(2 * time.Second)
@@ -841,12 +861,26 @@ func (p *OKXDEXClient) sendTransaction(ctx context.Context, to common.Address, v
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return receipt, txHash, ctx.Err()
 		case <-ticker.C:
 			h, e := p.client.HeaderByNumber(ctx, nil)
 			if e == nil && h.Number.Uint64() >= target {
-				return receipt, nil
+				return receipt, txHash, nil
 			}
 		}
 	}
+}
+
+func (p *OKXDEXClient) TransactionStatus(ctx context.Context, hash common.Hash) (string, error) {
+	receipt, err := p.client.TransactionReceipt(ctx, hash)
+	if errors.Is(err, ethereum.NotFound) {
+		return "pending", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if receipt.Status == types.ReceiptStatusSuccessful {
+		return "success", nil
+	}
+	return "reverted", nil
 }

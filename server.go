@@ -13,11 +13,21 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 //go:embed web/index.html
 var dashboardHTML string
+
+type dashboardAuth struct {
+	AdminUsername  string
+	AdminPassword  string
+	ViewerUsername string
+	ViewerPassword string
+}
+
+type dashboardActorKey struct{}
 
 func startHTTP(ctxDone <-chan struct{}, listen string, e *Engine) (*http.Server, error) {
 	if listen == "" {
@@ -27,15 +37,18 @@ func startHTTP(ctxDone <-chan struct{}, listen string, e *Engine) (*http.Server,
 	if err != nil {
 		return nil, err
 	}
-	password := ""
-	if e.cfg.Dashboard.AllowLAN {
-		password = os.Getenv(e.cfg.Dashboard.PasswordEnv)
-		if password == "" {
+	auth := dashboardAuth{AdminUsername: e.cfg.Dashboard.Username, AdminPassword: os.Getenv(e.cfg.Dashboard.PasswordEnv), ViewerUsername: e.cfg.Dashboard.ReadOnlyUsername, ViewerPassword: os.Getenv(e.cfg.Dashboard.ReadOnlyPasswordEnv)}
+	if e.cfg.Dashboard.AllowLAN || e.cfg.Mode == "live" {
+		if auth.AdminPassword == "" {
 			_ = listener.Close()
-			return nil, errors.New("LAN dashboard password environment variable is missing")
+			return nil, errors.New("dashboard administrator password environment variable is missing")
 		}
 	}
-	handler := dashboardHandler(e, password)
+	if auth.ViewerUsername != "" && auth.ViewerPassword == "" {
+		_ = listener.Close()
+		return nil, errors.New("dashboard read-only password environment variable is missing")
+	}
+	handler := dashboardHandlerWithAuth(e, auth)
 	s := &http.Server{Addr: listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	go func() {
 		<-ctxDone
@@ -52,9 +65,12 @@ func startHTTP(ctxDone <-chan struct{}, listen string, e *Engine) (*http.Server,
 }
 
 func dashboardHandler(e *Engine, password string) http.Handler {
+	return dashboardHandlerWithAuth(e, dashboardAuth{AdminUsername: e.cfg.Dashboard.Username, AdminPassword: password})
+}
+
+func dashboardHandlerWithAuth(e *Engine, auth dashboardAuth) http.Handler {
 	mux := http.NewServeMux()
 	refreshSeconds := e.cfg.Dashboard.RefreshSeconds
-	dashboardUsername := e.cfg.Dashboard.Username
 	write := func(w http.ResponseWriter, value any) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -70,6 +86,7 @@ func dashboardHandler(e *Engine, password string) http.Handler {
 	mux.HandleFunc("/v1/opportunities", func(w http.ResponseWriter, _ *http.Request) { write(w, e.Opportunities()) })
 	mux.HandleFunc("/v1/funding", func(w http.ResponseWriter, _ *http.Request) { write(w, e.FundingWatch()) })
 	mux.HandleFunc("/v1/positions", func(w http.ResponseWriter, _ *http.Request) { write(w, e.Health().Portfolio) })
+	mux.HandleFunc("/v1/pending-operations", func(w http.ResponseWriter, _ *http.Request) { write(w, e.PendingOperations()) })
 	mux.HandleFunc("/v1/ledger", func(w http.ResponseWriter, _ *http.Request) {
 		rows, err := e.Ledger(200)
 		if err != nil {
@@ -114,6 +131,8 @@ func dashboardHandler(e *Engine, password string) http.Handler {
 				http.Error(w, "settings could not be saved", http.StatusInternalServerError)
 				return
 			}
+			actor, _ := r.Context().Value(dashboardActorKey{}).(string)
+			_ = appendLedger(e.cfg.StateDir, map[string]any{"time": time.Now(), "event": "settings_audit", "actor": actor, "remote_addr": r.RemoteAddr})
 			write(w, result)
 		default:
 			w.Header().Set("Allow", "GET, POST")
@@ -130,18 +149,56 @@ func dashboardHandler(e *Engine, password string) http.Handler {
 		page := strings.ReplaceAll(dashboardHTML, "__REFRESH_SECONDS__", strconv.Itoa(refreshSeconds))
 		_, _ = w.Write([]byte(page))
 	})
-	if password == "" {
+	if auth.AdminPassword == "" {
 		return mux
 	}
+	type failureWindow struct {
+		Count        int
+		BlockedUntil time.Time
+	}
+	var authMu sync.Mutex
+	failures := map[string]failureWindow{}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if host == "" {
+			host = r.RemoteAddr
+		}
+		authMu.Lock()
+		window := failures[host]
+		blocked := window.BlockedUntil.After(time.Now())
+		authMu.Unlock()
+		if blocked {
+			http.Error(w, "too many authentication failures", http.StatusTooManyRequests)
+			return
+		}
 		username, supplied, ok := r.BasicAuth()
-		userOK := subtle.ConstantTimeCompare([]byte(username), []byte(dashboardUsername)) == 1
-		passOK := subtle.ConstantTimeCompare([]byte(supplied), []byte(password)) == 1
-		if !ok || !userOK || !passOK {
+		adminOK := ok && subtle.ConstantTimeCompare([]byte(username), []byte(auth.AdminUsername)) == 1 && subtle.ConstantTimeCompare([]byte(supplied), []byte(auth.AdminPassword)) == 1
+		viewerOK := ok && auth.ViewerUsername != "" && subtle.ConstantTimeCompare([]byte(username), []byte(auth.ViewerUsername)) == 1 && subtle.ConstantTimeCompare([]byte(supplied), []byte(auth.ViewerPassword)) == 1
+		if !adminOK && !viewerOK {
+			authMu.Lock()
+			window = failures[host]
+			window.Count++
+			if window.Count >= 5 {
+				window.BlockedUntil = time.Now().Add(30 * time.Second)
+				window.Count = 0
+			}
+			failures[host] = window
+			authMu.Unlock()
 			w.Header().Set("WWW-Authenticate", `Basic realm="Funding Monitor", charset="UTF-8"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		mux.ServeHTTP(w, r)
+		authMu.Lock()
+		delete(failures, host)
+		authMu.Unlock()
+		if viewerOK && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "read-only account", http.StatusForbidden)
+			return
+		}
+		actor := "viewer:" + username
+		if adminOK {
+			actor = "admin:" + username
+		}
+		mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), dashboardActorKey{}, actor)))
 	})
 }
