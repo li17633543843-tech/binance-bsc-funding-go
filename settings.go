@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -81,6 +82,9 @@ func applyTuning(c *Config, t TuningSettings) {
 	}
 	if c.Risk.MinBSCUSDTReserve == 0 {
 		c.Risk.MinBSCUSDTReserve = 20
+	}
+	if c.Risk.MaxEntryChainPriceImpactBPS == 0 {
+		c.Risk.MaxEntryChainPriceImpactBPS = math.Min(20, c.Risk.MaxChainPriceImpactBPS)
 	}
 }
 

@@ -84,6 +84,7 @@
     "depth_emergency_shortfall_percent": 50,
     "depth_breach_confirmations": 3,
     "depth_close_cooldown_hours": 24,
+	"max_entry_chain_price_impact_bps": 20,
     "max_chain_price_impact_bps": 35,
     "reference_quote_usdt": 10,
     "min_liquidation_distance_x": 3.0,

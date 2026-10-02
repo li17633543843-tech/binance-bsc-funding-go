@@ -278,6 +278,78 @@ func TestPositionExitCapacityUsesActualSellSideAndCurrentSize(t *testing.T) {
 	}
 }
 
+func TestDepthCapacityRequiresStrictBuyAndSellSideEntryLiquidity(t *testing.T) {
+	const tokenAddress = "0x1111111111111111111111111111111111111111"
+	const usdtAddress = "0x2222222222222222222222222222222222222222"
+	var buyQuotes, sellQuotes int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v6/dex/aggregator/quote" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		from, to := r.URL.Query().Get("fromTokenAddress"), r.URL.Query().Get("toTokenAddress")
+		amount := r.URL.Query().Get("amount")
+		impact := "0.05" // 5 bps buy side: acceptable.
+		if strings.EqualFold(from, tokenAddress) && strings.EqualFold(to, usdtAddress) {
+			sellQuotes++
+			impact = "0.30" // 30 bps sell side: above the 20 bps entry guard.
+		} else if strings.EqualFold(from, usdtAddress) && strings.EqualFold(to, tokenAddress) {
+			buyQuotes++
+		} else {
+			t.Fatalf("unexpected quote direction: %s", r.URL.RawQuery)
+		}
+		response := map[string]any{
+			"code": "0",
+			"msg":  "",
+			"data": []any{map[string]any{
+				"chainIndex":         "56",
+				"fromTokenAmount":    amount,
+				"toTokenAmount":      amount,
+				"estimateGasFee":     "100000",
+				"priceImpactPercent": impact,
+				"router":             "test-router",
+				"fromToken":          map[string]any{"tokenContractAddress": from, "tokenSymbol": "FROM", "taxRate": "0", "isHoneyPot": false},
+				"toToken":            map[string]any{"tokenContractAddress": to, "tokenSymbol": "TO", "taxRate": "0", "isHoneyPot": false},
+			}},
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &OKXDEXClient{
+		bsc:        BSCConfig{ChainID: 56, USDTAddress: usdtAddress, USDTDecimals: 0},
+		cfg:        OKXDEXConfig{BaseURL: server.URL},
+		http:       server.Client(),
+		apiKey:     "test",
+		secret:     "test",
+		passphrase: "test",
+		projectID:  "test",
+	}
+	cfg := Config{Risk: RiskConfig{
+		TotalCapitalUSDT:            1000,
+		TargetNotionalPerCoinUSDT:   100,
+		MaxNotionalPerCoinUSDT:      100,
+		MaxCapitalPerCoinPercent:    100,
+		DepthSafetyMultiplier:       3,
+		MaxEntryChainPriceImpactBPS: 20,
+		MaxChainPriceImpactBPS:      35,
+		ReferenceQuoteUSDT:          1,
+	}}
+	token := TokenConfig{Symbol: "TEST", BSCAddress: tokenAddress, Decimals: 0, MaxNotionalUSDT: 100}
+	capacity, quote, err := client.DepthCapacity(t.Context(), token, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity != 0 {
+		t.Fatalf("asymmetric sell depth passed entry filter: capacity=%f quote=%+v", capacity, quote)
+	}
+	if quote.BuyPriceImpactBPS != 5 || quote.SellPriceImpactBPS != 30 {
+		t.Fatalf("entry quote did not retain both side impacts: %+v", quote)
+	}
+	if buyQuotes != 2 || sellQuotes != 2 {
+		t.Fatalf("expected required and fallback round-trip probes, buys=%d sells=%d", buyQuotes, sellQuotes)
+	}
+}
+
 func TestDepthBreachNeedsConsecutiveConfirmations(t *testing.T) {
 	count, confirmed := confirmDepthBreach(0, true, 3)
 	if count != 1 || confirmed {

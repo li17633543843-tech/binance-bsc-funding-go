@@ -58,6 +58,8 @@ type ChainQuote struct {
 	SellPrice             float64  `json:"sell_price"`
 	RoundTripLossBPS      float64  `json:"round_trip_loss_bps"`
 	DepthImpactBPS        float64  `json:"depth_impact_bps"`
+	BuyPriceImpactBPS     float64  `json:"buy_price_impact_bps"`
+	SellPriceImpactBPS    float64  `json:"sell_price_impact_bps"`
 	GasEstimate           uint64   `json:"gas_estimate"`
 	OKXPriceImpactPercent float64  `json:"okx_price_impact_percent"`
 }

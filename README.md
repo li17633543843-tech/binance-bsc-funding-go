@@ -148,6 +148,8 @@ $env:FUNDING_BOT_DASHBOARD_PASSWORD='请设置一个长随机密码'
 - `target_notional_per_coin_usdt`: 单币目标名义金额。
 - `max_capital_per_coin_percent`: 单币占总资金上限。
 - `depth_safety_multiplier`: 例如 3 表示链上在 3 倍仓位下仍需通过冲击限制。
+- `max_entry_chain_price_impact_bps`: 入场专用的双向冲击上限；买入或卖出任一方向超过该值都不能进入候选池，默认 20 bps。
+- `max_chain_price_impact_bps`: 已有仓位卖出容量检查使用的上限，默认 35 bps；高于入场线，为正常流动性波动预留缓冲。
 - `depth_reduction_trigger_percent`: 当前仓位超过安全容量多少百分比才视为深度违规，默认 10。
 - `min_depth_reduction_percent`: 忽略小于该比例的微小减仓，默认 5。
 - `depth_emergency_shortfall_percent`: 首次资金费结算前仍允许处理的紧急容量短缺比例，默认 50。

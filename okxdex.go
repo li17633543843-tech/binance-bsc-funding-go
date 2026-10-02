@@ -527,15 +527,31 @@ func (p *OKXDEXClient) BestQuote(ctx context.Context, t TokenConfig, notional, r
 	if tokens <= 0 {
 		return ChainQuote{}, fmt.Errorf("OKX DEX returned zero %s amount", t.Symbol)
 	}
-	_, sellOut, err := p.quote(ctx, t.BSCAddress, p.bsc.USDTAddress, buyOut)
+	sell, sellOut, err := p.quote(ctx, t.BSCAddress, p.bsc.USDTAddress, buyOut)
 	if err != nil {
 		return ChainQuote{}, err
 	}
 	sellUSDT := decimal(sellOut, p.bsc.USDTDecimals)
 	buyPrice := notional / tokens
 	gas, _ := strconv.ParseUint(buy.EstimateGasFee, 10, 64)
-	okxImpact, _ := strconv.ParseFloat(buy.PriceImpact, 64)
-	return ChainQuote{Symbol: t.Symbol, Route: buy.Router, DEXes: quoteDEXes(buy), InputUSDT: notional, OutputTokens: tokens, BuyPrice: buyPrice, SellPrice: sellUSDT / tokens, RoundTripLossBPS: math.Max(0, (notional-sellUSDT)/notional*10000), DepthImpactBPS: math.Abs(okxImpact) * 100, GasEstimate: gas, OKXPriceImpactPercent: okxImpact}, nil
+	buyImpactBPS, err := parsedPriceImpactBPS(buy.PriceImpact, t.Symbol+" buy")
+	if err != nil {
+		return ChainQuote{}, err
+	}
+	sellImpactBPS, err := parsedPriceImpactBPS(sell.PriceImpact, t.Symbol+" sell")
+	if err != nil {
+		return ChainQuote{}, err
+	}
+	okxImpact, _ := strconv.ParseFloat(strings.TrimSpace(buy.PriceImpact), 64)
+	return ChainQuote{Symbol: t.Symbol, Route: buy.Router, DEXes: quoteDEXes(buy), InputUSDT: notional, OutputTokens: tokens, BuyPrice: buyPrice, SellPrice: sellUSDT / tokens, RoundTripLossBPS: math.Max(0, (notional-sellUSDT)/notional*10000), DepthImpactBPS: buyImpactBPS, BuyPriceImpactBPS: buyImpactBPS, SellPriceImpactBPS: sellImpactBPS, GasEstimate: gas, OKXPriceImpactPercent: okxImpact}, nil
+}
+
+func parsedPriceImpactBPS(raw, label string) (float64, error) {
+	impactPercent, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(impactPercent) || math.IsInf(impactPercent, 0) {
+		return 0, fmt.Errorf("OKX DEX %s quote returned invalid price impact %q", label, raw)
+	}
+	return math.Abs(impactPercent) * 100, nil
 }
 
 func (p *OKXDEXClient) positionExitQuote(ctx context.Context, t TokenConfig, tokenQty, referencePrice float64) (PositionExitQuote, error) {
@@ -553,16 +569,16 @@ func (p *OKXDEXClient) positionExitQuote(ctx context.Context, t TokenConfig, tok
 	if value <= 0 {
 		return PositionExitQuote{}, fmt.Errorf("OKX DEX sell quote for %s returned zero", t.Symbol)
 	}
-	impactPercent, err := strconv.ParseFloat(strings.TrimSpace(quote.PriceImpact), 64)
-	if err != nil || math.IsNaN(impactPercent) || math.IsInf(impactPercent, 0) {
-		return PositionExitQuote{}, fmt.Errorf("OKX DEX sell quote for %s returned invalid price impact %q", t.Symbol, quote.PriceImpact)
+	impactBPS, err := parsedPriceImpactBPS(quote.PriceImpact, t.Symbol+" sell")
+	if err != nil {
+		return PositionExitQuote{}, err
 	}
 	return PositionExitQuote{
 		TokenQty:       tokenQty,
 		ReferenceUSDT:  tokenQty * referencePrice,
 		OutputUSDT:     value,
 		ExecutionPrice: value / tokenQty,
-		PriceImpactBPS: math.Abs(impactPercent) * 100,
+		PriceImpactBPS: impactBPS,
 	}, nil
 }
 
@@ -621,13 +637,17 @@ func (p *OKXDEXClient) DepthCapacity(ctx context.Context, t TokenConfig, c Confi
 		probes = append(probes, c.Risk.TargetNotionalPerCoinUSDT)
 	}
 	var last ChainQuote
+	entryImpactLimit := c.Risk.MaxEntryChainPriceImpactBPS
+	if entryImpactLimit <= 0 {
+		entryImpactLimit = math.Min(20, c.Risk.MaxChainPriceImpactBPS)
+	}
 	for _, probe := range probes {
 		q, err := p.BestQuote(ctx, t, probe, c.Risk.ReferenceQuoteUSDT)
 		if err != nil {
 			return 0, ChainQuote{}, err
 		}
 		last = q
-		if q.DepthImpactBPS <= c.Risk.MaxChainPriceImpactBPS && math.Abs(q.OKXPriceImpactPercent)*100 <= c.Risk.MaxChainPriceImpactBPS {
+		if q.BuyPriceImpactBPS <= entryImpactLimit && q.SellPriceImpactBPS <= entryImpactLimit {
 			return probe, q, nil
 		}
 	}

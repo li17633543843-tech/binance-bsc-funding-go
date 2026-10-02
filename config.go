@@ -120,6 +120,7 @@ type RiskConfig struct {
 	DepthEmergencyShortfallPct     float64 `json:"depth_emergency_shortfall_percent"`
 	DepthBreachConfirmations       int     `json:"depth_breach_confirmations"`
 	DepthCloseCooldownHours        float64 `json:"depth_close_cooldown_hours"`
+	MaxEntryChainPriceImpactBPS    float64 `json:"max_entry_chain_price_impact_bps"`
 	MaxChainPriceImpactBPS         float64 `json:"max_chain_price_impact_bps"`
 	ReferenceQuoteUSDT             float64 `json:"reference_quote_usdt"`
 	MinLiquidationDistanceX        float64 `json:"min_liquidation_distance_x"`
@@ -214,6 +215,9 @@ func applyConfigDefaults(c *Config) {
 	if c.Risk.DepthCloseCooldownHours == 0 {
 		c.Risk.DepthCloseCooldownHours = 24
 	}
+	if c.Risk.MaxEntryChainPriceImpactBPS == 0 {
+		c.Risk.MaxEntryChainPriceImpactBPS = math.Min(20, c.Risk.MaxChainPriceImpactBPS)
+	}
 	if c.Risk.LiquidationBreachConfirmations == 0 {
 		c.Risk.LiquidationBreachConfirmations = 3
 	}
@@ -305,7 +309,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("auto_discovery.deny_symbols[%d] must be uppercase", i)
 		}
 	}
-	nums := []float64{c.Binance.TakerFeeBPS, c.BSC.SlippageBPS, c.BSC.GasReserveUSDT, c.BSC.MaxGasPriceGwei, c.Strategy.MinCurrentFundingBPS, c.Strategy.MinFundingAPRPercent, c.Strategy.FundingIntervalsPerYear, c.Strategy.FundingEWMAAlpha, c.Strategy.MinPositiveFundingRatio, c.Strategy.MaxCurrentToMedianRatio, c.Strategy.MinCostCoverageRatio, c.Strategy.EvaluationHoldHours, c.Strategy.MaxEntryPaybackDays, c.Strategy.MaxEntryBasisBPS, c.Strategy.MinSwitchAPRAdvantage, c.Strategy.MinSwitchProfitUSDT, c.Strategy.MinPositionAgeHours, c.Strategy.PriceSpreadTakeProfitBPS, c.Strategy.MinPriceArbNetUSDT, c.Strategy.PriceArbCooldownHours, c.Risk.TotalCapitalUSDT, c.Risk.TargetNotionalPerCoinUSDT, c.Risk.MaxNotionalPerCoinUSDT, c.Risk.MaxCapitalPerCoinPercent, c.Risk.DepthSafetyMultiplier, c.Risk.DepthReductionTriggerPercent, c.Risk.MinDepthReductionPercent, c.Risk.DepthEmergencyShortfallPct, c.Risk.DepthCloseCooldownHours, c.Risk.MaxChainPriceImpactBPS, c.Risk.ReferenceQuoteUSDT, c.Risk.MinLiquidationDistanceX, c.Risk.EmergencyLiquidationDistanceX, c.Risk.SlowReducePercent, c.Risk.AccountMarginStopEntryPercent, c.Risk.AccountMarginReducePercent, c.Risk.AccountMarginHighPercent, c.Risk.AccountMarginEmergencyPercent, c.Risk.AccountHighReducePercent, c.Risk.AccountEmergencyReducePercent, c.Risk.MaxHedgeDriftPercent, c.Risk.MaxDailyLossUSDT, c.Risk.MaxFuturesMarginUsePercent, c.Risk.MinBSCUSDTReserve}
+	nums := []float64{c.Binance.TakerFeeBPS, c.BSC.SlippageBPS, c.BSC.GasReserveUSDT, c.BSC.MaxGasPriceGwei, c.Strategy.MinCurrentFundingBPS, c.Strategy.MinFundingAPRPercent, c.Strategy.FundingIntervalsPerYear, c.Strategy.FundingEWMAAlpha, c.Strategy.MinPositiveFundingRatio, c.Strategy.MaxCurrentToMedianRatio, c.Strategy.MinCostCoverageRatio, c.Strategy.EvaluationHoldHours, c.Strategy.MaxEntryPaybackDays, c.Strategy.MaxEntryBasisBPS, c.Strategy.MinSwitchAPRAdvantage, c.Strategy.MinSwitchProfitUSDT, c.Strategy.MinPositionAgeHours, c.Strategy.PriceSpreadTakeProfitBPS, c.Strategy.MinPriceArbNetUSDT, c.Strategy.PriceArbCooldownHours, c.Risk.TotalCapitalUSDT, c.Risk.TargetNotionalPerCoinUSDT, c.Risk.MaxNotionalPerCoinUSDT, c.Risk.MaxCapitalPerCoinPercent, c.Risk.DepthSafetyMultiplier, c.Risk.DepthReductionTriggerPercent, c.Risk.MinDepthReductionPercent, c.Risk.DepthEmergencyShortfallPct, c.Risk.DepthCloseCooldownHours, c.Risk.MaxEntryChainPriceImpactBPS, c.Risk.MaxChainPriceImpactBPS, c.Risk.ReferenceQuoteUSDT, c.Risk.MinLiquidationDistanceX, c.Risk.EmergencyLiquidationDistanceX, c.Risk.SlowReducePercent, c.Risk.AccountMarginStopEntryPercent, c.Risk.AccountMarginReducePercent, c.Risk.AccountMarginHighPercent, c.Risk.AccountMarginEmergencyPercent, c.Risk.AccountHighReducePercent, c.Risk.AccountEmergencyReducePercent, c.Risk.MaxHedgeDriftPercent, c.Risk.MaxDailyLossUSDT, c.Risk.MaxFuturesMarginUsePercent, c.Risk.MinBSCUSDTReserve}
 	for _, v := range nums {
 		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 			return errors.New("numeric settings must be finite and nonnegative")
@@ -340,6 +344,9 @@ func (c Config) Validate() error {
 	}
 	if c.Risk.MaxHedgeDriftPercent <= 0 || c.BSC.SlippageBPS > 500 || c.Risk.MaxChainPriceImpactBPS > 1000 || (c.Strategy.PriceSpreadTakeProfitBPS > 0 && c.Strategy.PriceArbCooldownHours <= 0) {
 		return errors.New("invalid slippage, impact, hedge drift or spread cooldown")
+	}
+	if c.Risk.MaxEntryChainPriceImpactBPS <= 0 || c.Risk.MaxEntryChainPriceImpactBPS > c.Risk.MaxChainPriceImpactBPS {
+		return errors.New("max_entry_chain_price_impact_bps must be positive and no greater than max_chain_price_impact_bps")
 	}
 	if c.Risk.MaxFuturesMarginUsePercent <= 0 || c.Risk.MaxFuturesMarginUsePercent > 100 {
 		return errors.New("max_futures_margin_use_percent must be between 0 and 100")
