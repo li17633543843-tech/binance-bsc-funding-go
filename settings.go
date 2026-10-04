@@ -86,6 +86,30 @@ func applyTuning(c *Config, t TuningSettings) {
 	if c.Risk.MaxEntryChainPriceImpactBPS == 0 {
 		c.Risk.MaxEntryChainPriceImpactBPS = math.Min(20, c.Risk.MaxChainPriceImpactBPS)
 	}
+	if c.Strategy.DepthHistoryProbeMinBPS == 0 {
+		c.Strategy.DepthHistoryProbeMinBPS = math.Min(1, c.Strategy.MinCurrentFundingBPS)
+	}
+	if c.Strategy.DepthHistoryWindowHours == 0 {
+		c.Strategy.DepthHistoryWindowHours = 24
+	}
+	if c.Strategy.DepthHistoryMaxSamples == 0 {
+		c.Strategy.DepthHistoryMaxSamples = 48
+	}
+	if c.Strategy.DepthHistoryHalfSamples == 0 {
+		c.Strategy.DepthHistoryHalfSamples = 12
+	}
+	if c.Strategy.DepthHistoryFullSamples == 0 {
+		c.Strategy.DepthHistoryFullSamples = 24
+	}
+	if c.Strategy.DepthHistoryMinSpanMinutes == 0 {
+		c.Strategy.DepthHistoryMinSpanMinutes = 180
+	}
+	if c.Strategy.DepthHistoryMinPassRatio == 0 {
+		c.Strategy.DepthHistoryMinPassRatio = .85
+	}
+	if c.Strategy.DepthHistoryColdStartConfirmations == 0 {
+		c.Strategy.DepthHistoryColdStartConfirmations = 3
+	}
 }
 
 func tuningPath(stateDir string) string { return filepath.Join(stateDir, "ui-tuning.json") }

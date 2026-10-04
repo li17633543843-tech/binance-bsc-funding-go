@@ -84,29 +84,37 @@ type DashboardConfig struct {
 }
 
 type StrategyConfig struct {
-	TargetPositions          int     `json:"target_positions"`
-	MaxQuoteCandidates       int     `json:"max_quote_candidates"`
-	ChainQuoteRefreshMinutes int     `json:"chain_quote_refresh_minutes"`
-	MinCurrentFundingBPS     float64 `json:"min_current_funding_bps_per_interval"`
-	MinFundingAPRPercent     float64 `json:"min_funding_apr_percent"`
-	FundingIntervalsPerYear  float64 `json:"funding_intervals_per_year"`
-	FundingEWMAAlpha         float64 `json:"funding_ewma_alpha"`
-	FundingHistoryDays       int     `json:"funding_history_days"`
-	MinFundingHistorySamples int     `json:"min_funding_history_samples"`
-	MinPositiveFundingRatio  float64 `json:"min_positive_funding_ratio"`
-	MaxCurrentToMedianRatio  float64 `json:"max_current_to_median_ratio"`
-	EntryConfirmationScans   int     `json:"entry_confirmation_scans"`
-	WeakFundingSettlements   int     `json:"weak_funding_settlements"`
-	MinCostCoverageRatio     float64 `json:"min_cost_coverage_ratio"`
-	EvaluationHoldHours      float64 `json:"evaluation_hold_hours"`
-	MaxEntryPaybackDays      float64 `json:"max_entry_payback_days"`
-	MaxEntryBasisBPS         float64 `json:"max_entry_basis_bps"`
-	MinSwitchAPRAdvantage    float64 `json:"min_switch_apr_advantage_percent"`
-	MinSwitchProfitUSDT      float64 `json:"min_switch_profit_usdt"`
-	MinPositionAgeHours      float64 `json:"min_position_age_hours_before_switch"`
-	PriceSpreadTakeProfitBPS float64 `json:"price_spread_take_profit_bps"`
-	MinPriceArbNetUSDT       float64 `json:"min_price_arb_net_usdt"`
-	PriceArbCooldownHours    float64 `json:"price_arb_cooldown_hours"`
+	TargetPositions                    int     `json:"target_positions"`
+	MaxQuoteCandidates                 int     `json:"max_quote_candidates"`
+	ChainQuoteRefreshMinutes           int     `json:"chain_quote_refresh_minutes"`
+	MinCurrentFundingBPS               float64 `json:"min_current_funding_bps_per_interval"`
+	MinFundingAPRPercent               float64 `json:"min_funding_apr_percent"`
+	FundingIntervalsPerYear            float64 `json:"funding_intervals_per_year"`
+	FundingEWMAAlpha                   float64 `json:"funding_ewma_alpha"`
+	FundingHistoryDays                 int     `json:"funding_history_days"`
+	MinFundingHistorySamples           int     `json:"min_funding_history_samples"`
+	MinPositiveFundingRatio            float64 `json:"min_positive_funding_ratio"`
+	MaxCurrentToMedianRatio            float64 `json:"max_current_to_median_ratio"`
+	EntryConfirmationScans             int     `json:"entry_confirmation_scans"`
+	DepthHistoryProbeMinBPS            float64 `json:"depth_history_probe_min_funding_bps"`
+	DepthHistoryWindowHours            int     `json:"depth_history_window_hours"`
+	DepthHistoryMaxSamples             int     `json:"depth_history_max_samples"`
+	DepthHistoryHalfSamples            int     `json:"depth_history_half_samples"`
+	DepthHistoryFullSamples            int     `json:"depth_history_full_samples"`
+	DepthHistoryMinSpanMinutes         int     `json:"depth_history_min_span_minutes"`
+	DepthHistoryMinPassRatio           float64 `json:"depth_history_min_pass_ratio"`
+	DepthHistoryColdStartConfirmations int     `json:"depth_history_cold_start_confirmations"`
+	WeakFundingSettlements             int     `json:"weak_funding_settlements"`
+	MinCostCoverageRatio               float64 `json:"min_cost_coverage_ratio"`
+	EvaluationHoldHours                float64 `json:"evaluation_hold_hours"`
+	MaxEntryPaybackDays                float64 `json:"max_entry_payback_days"`
+	MaxEntryBasisBPS                   float64 `json:"max_entry_basis_bps"`
+	MinSwitchAPRAdvantage              float64 `json:"min_switch_apr_advantage_percent"`
+	MinSwitchProfitUSDT                float64 `json:"min_switch_profit_usdt"`
+	MinPositionAgeHours                float64 `json:"min_position_age_hours_before_switch"`
+	PriceSpreadTakeProfitBPS           float64 `json:"price_spread_take_profit_bps"`
+	MinPriceArbNetUSDT                 float64 `json:"min_price_arb_net_usdt"`
+	PriceArbCooldownHours              float64 `json:"price_arb_cooldown_hours"`
 }
 
 type RiskConfig struct {
@@ -190,6 +198,30 @@ func applyConfigDefaults(c *Config) {
 	}
 	if c.Strategy.EntryConfirmationScans == 0 {
 		c.Strategy.EntryConfirmationScans = 2
+	}
+	if c.Strategy.DepthHistoryProbeMinBPS == 0 {
+		c.Strategy.DepthHistoryProbeMinBPS = math.Min(1, c.Strategy.MinCurrentFundingBPS)
+	}
+	if c.Strategy.DepthHistoryWindowHours == 0 {
+		c.Strategy.DepthHistoryWindowHours = 24
+	}
+	if c.Strategy.DepthHistoryMaxSamples == 0 {
+		c.Strategy.DepthHistoryMaxSamples = 48
+	}
+	if c.Strategy.DepthHistoryHalfSamples == 0 {
+		c.Strategy.DepthHistoryHalfSamples = 12
+	}
+	if c.Strategy.DepthHistoryFullSamples == 0 {
+		c.Strategy.DepthHistoryFullSamples = 24
+	}
+	if c.Strategy.DepthHistoryMinSpanMinutes == 0 {
+		c.Strategy.DepthHistoryMinSpanMinutes = 180
+	}
+	if c.Strategy.DepthHistoryMinPassRatio == 0 {
+		c.Strategy.DepthHistoryMinPassRatio = .85
+	}
+	if c.Strategy.DepthHistoryColdStartConfirmations == 0 {
+		c.Strategy.DepthHistoryColdStartConfirmations = 3
 	}
 	if c.Strategy.WeakFundingSettlements == 0 {
 		c.Strategy.WeakFundingSettlements = 3
@@ -309,7 +341,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("auto_discovery.deny_symbols[%d] must be uppercase", i)
 		}
 	}
-	nums := []float64{c.Binance.TakerFeeBPS, c.BSC.SlippageBPS, c.BSC.GasReserveUSDT, c.BSC.MaxGasPriceGwei, c.Strategy.MinCurrentFundingBPS, c.Strategy.MinFundingAPRPercent, c.Strategy.FundingIntervalsPerYear, c.Strategy.FundingEWMAAlpha, c.Strategy.MinPositiveFundingRatio, c.Strategy.MaxCurrentToMedianRatio, c.Strategy.MinCostCoverageRatio, c.Strategy.EvaluationHoldHours, c.Strategy.MaxEntryPaybackDays, c.Strategy.MaxEntryBasisBPS, c.Strategy.MinSwitchAPRAdvantage, c.Strategy.MinSwitchProfitUSDT, c.Strategy.MinPositionAgeHours, c.Strategy.PriceSpreadTakeProfitBPS, c.Strategy.MinPriceArbNetUSDT, c.Strategy.PriceArbCooldownHours, c.Risk.TotalCapitalUSDT, c.Risk.TargetNotionalPerCoinUSDT, c.Risk.MaxNotionalPerCoinUSDT, c.Risk.MaxCapitalPerCoinPercent, c.Risk.DepthSafetyMultiplier, c.Risk.DepthReductionTriggerPercent, c.Risk.MinDepthReductionPercent, c.Risk.DepthEmergencyShortfallPct, c.Risk.DepthCloseCooldownHours, c.Risk.MaxEntryChainPriceImpactBPS, c.Risk.MaxChainPriceImpactBPS, c.Risk.ReferenceQuoteUSDT, c.Risk.MinLiquidationDistanceX, c.Risk.EmergencyLiquidationDistanceX, c.Risk.SlowReducePercent, c.Risk.AccountMarginStopEntryPercent, c.Risk.AccountMarginReducePercent, c.Risk.AccountMarginHighPercent, c.Risk.AccountMarginEmergencyPercent, c.Risk.AccountHighReducePercent, c.Risk.AccountEmergencyReducePercent, c.Risk.MaxHedgeDriftPercent, c.Risk.MaxDailyLossUSDT, c.Risk.MaxFuturesMarginUsePercent, c.Risk.MinBSCUSDTReserve}
+	nums := []float64{c.Binance.TakerFeeBPS, c.BSC.SlippageBPS, c.BSC.GasReserveUSDT, c.BSC.MaxGasPriceGwei, c.Strategy.MinCurrentFundingBPS, c.Strategy.MinFundingAPRPercent, c.Strategy.FundingIntervalsPerYear, c.Strategy.FundingEWMAAlpha, c.Strategy.MinPositiveFundingRatio, c.Strategy.MaxCurrentToMedianRatio, c.Strategy.DepthHistoryProbeMinBPS, c.Strategy.DepthHistoryMinPassRatio, c.Strategy.MinCostCoverageRatio, c.Strategy.EvaluationHoldHours, c.Strategy.MaxEntryPaybackDays, c.Strategy.MaxEntryBasisBPS, c.Strategy.MinSwitchAPRAdvantage, c.Strategy.MinSwitchProfitUSDT, c.Strategy.MinPositionAgeHours, c.Strategy.PriceSpreadTakeProfitBPS, c.Strategy.MinPriceArbNetUSDT, c.Strategy.PriceArbCooldownHours, c.Risk.TotalCapitalUSDT, c.Risk.TargetNotionalPerCoinUSDT, c.Risk.MaxNotionalPerCoinUSDT, c.Risk.MaxCapitalPerCoinPercent, c.Risk.DepthSafetyMultiplier, c.Risk.DepthReductionTriggerPercent, c.Risk.MinDepthReductionPercent, c.Risk.DepthEmergencyShortfallPct, c.Risk.DepthCloseCooldownHours, c.Risk.MaxEntryChainPriceImpactBPS, c.Risk.MaxChainPriceImpactBPS, c.Risk.ReferenceQuoteUSDT, c.Risk.MinLiquidationDistanceX, c.Risk.EmergencyLiquidationDistanceX, c.Risk.SlowReducePercent, c.Risk.AccountMarginStopEntryPercent, c.Risk.AccountMarginReducePercent, c.Risk.AccountMarginHighPercent, c.Risk.AccountMarginEmergencyPercent, c.Risk.AccountHighReducePercent, c.Risk.AccountEmergencyReducePercent, c.Risk.MaxHedgeDriftPercent, c.Risk.MaxDailyLossUSDT, c.Risk.MaxFuturesMarginUsePercent, c.Risk.MinBSCUSDTReserve}
 	for _, v := range nums {
 		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 			return errors.New("numeric settings must be finite and nonnegative")
@@ -320,6 +352,9 @@ func (c Config) Validate() error {
 	}
 	if c.Strategy.FundingHistoryDays < 30 || c.Strategy.FundingHistoryDays > 90 || c.Strategy.MinFundingHistorySamples < 3 || c.Strategy.MinFundingHistorySamples > 1000 || c.Strategy.MinPositiveFundingRatio <= 0 || c.Strategy.MinPositiveFundingRatio > 1 || c.Strategy.MaxCurrentToMedianRatio < 1 || c.Strategy.EntryConfirmationScans < 1 || c.Strategy.EntryConfirmationScans > 10 || c.Strategy.WeakFundingSettlements < 1 || c.Strategy.WeakFundingSettlements > 10 || c.Strategy.MinCostCoverageRatio < 1 {
 		return errors.New("invalid historical funding, entry confirmation or cost coverage settings")
+	}
+	if c.Strategy.DepthHistoryProbeMinBPS > c.Strategy.MinCurrentFundingBPS || c.Strategy.DepthHistoryWindowHours < 1 || c.Strategy.DepthHistoryWindowHours > 168 || c.Strategy.DepthHistoryMaxSamples < 3 || c.Strategy.DepthHistoryMaxSamples > 500 || c.Strategy.DepthHistoryHalfSamples < 3 || c.Strategy.DepthHistoryFullSamples < c.Strategy.DepthHistoryHalfSamples || c.Strategy.DepthHistoryFullSamples > c.Strategy.DepthHistoryMaxSamples || c.Strategy.DepthHistoryMinSpanMinutes < 10 || c.Strategy.DepthHistoryMinSpanMinutes > c.Strategy.DepthHistoryWindowHours*60 || c.Strategy.DepthHistoryMinPassRatio <= 0 || c.Strategy.DepthHistoryMinPassRatio > 1 || c.Strategy.DepthHistoryColdStartConfirmations < 2 || c.Strategy.DepthHistoryColdStartConfirmations > c.Strategy.DepthHistoryHalfSamples {
+		return errors.New("invalid historical two-sided depth settings")
 	}
 	if c.Strategy.MaxEntryBasisBPS <= 0 || c.Strategy.MaxEntryBasisBPS > 1000 {
 		return errors.New("max_entry_basis_bps must be between 0 and 1000")

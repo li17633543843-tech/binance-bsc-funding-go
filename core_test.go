@@ -88,6 +88,152 @@ func TestFundingHistoryMergeDeduplicatesAndTrims(t *testing.T) {
 	}
 }
 
+func TestDepthQuoteHistorySurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	observed := time.Date(2026, 10, 4, 8, 0, 0, 0, time.UTC)
+	state := &BotState{
+		Version: currentStateVersion,
+		DepthQuoteHistory: map[string][]DepthQuoteSample{
+			"CAKEUSDT": {{
+				Time:              observed,
+				ProbeNotionalUSDT: 900,
+				BuyImpactBPS:      8,
+				SellImpactBPS:     11,
+				Passed:            true,
+			}},
+		},
+	}
+	if err := saveState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples := loaded.DepthQuoteHistory["CAKEUSDT"]
+	if len(samples) != 1 || !samples[0].Time.Equal(observed) || samples[0].SellImpactBPS != 11 || !samples[0].Passed {
+		t.Fatalf("depth quote history was not preserved: %+v", samples)
+	}
+}
+
+func TestDepthQuoteHistoryStagesEntrySizeByObservedQuality(t *testing.T) {
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	strategy := StrategyConfig{
+		DepthHistoryWindowHours:            24,
+		DepthHistoryHalfSamples:            12,
+		DepthHistoryFullSamples:            24,
+		DepthHistoryMinSpanMinutes:         180,
+		DepthHistoryMinPassRatio:           .85,
+		DepthHistoryColdStartConfirmations: 3,
+	}
+	makeSamples := func(count int, span time.Duration, failed int) []DepthQuoteSample {
+		out := make([]DepthQuoteSample, 0, count)
+		step := time.Duration(0)
+		if count > 1 {
+			step = span / time.Duration(count-1)
+		}
+		for i := 0; i < count; i++ {
+			impact := 10.0
+			if i < failed {
+				impact = 30
+			}
+			out = append(out, DepthQuoteSample{Time: now.Add(-span).Add(time.Duration(i) * step), ProbeNotionalUSDT: 900, BuyImpactBPS: impact, SellImpactBPS: impact})
+		}
+		return out
+	}
+
+	quarter := AssessDepthQuoteHistory(makeSamples(3, 20*time.Minute, 0), now, strategy, 20)
+	if quarter.AllocationFraction != .25 || quarter.Stage != "quarter" {
+		t.Fatalf("cold start should allow only a quarter position: %+v", quarter)
+	}
+	half := AssessDepthQuoteHistory(makeSamples(12, 90*time.Minute, 0), now, strategy, 20)
+	if half.AllocationFraction != .5 || half.Stage != "half" {
+		t.Fatalf("twelve stable samples should allow a half position: %+v", half)
+	}
+	full := AssessDepthQuoteHistory(makeSamples(24, 3*time.Hour, 0), now, strategy, 20)
+	if full.AllocationFraction != 1 || full.Stage != "full" || full.PassRatio != 1 || full.BuyP90BPS != 10 || full.SellP90BPS != 10 {
+		t.Fatalf("mature stable history should allow a full position: %+v", full)
+	}
+	rejected := AssessDepthQuoteHistory(makeSamples(20, 3*time.Hour, 4), now, strategy, 20)
+	if rejected.AllocationFraction != 0 || rejected.Stage != "rejected" {
+		t.Fatalf("history below the pass-ratio floor must reject entry: %+v", rejected)
+	}
+}
+
+func TestRecordDepthQuoteKeepsOnlyRecentBoundedSamples(t *testing.T) {
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	history := []DepthQuoteSample{
+		{Time: now.Add(-25 * time.Hour), ProbeNotionalUSDT: 900, BuyImpactBPS: 1, SellImpactBPS: 1},
+		{Time: now.Add(-3 * time.Hour), ProbeNotionalUSDT: 900, BuyImpactBPS: 2, SellImpactBPS: 2},
+		{Time: now.Add(-2 * time.Hour), ProbeNotionalUSDT: 900, BuyImpactBPS: 3, SellImpactBPS: 3},
+	}
+	got := RecordDepthQuote(history, DepthQuoteSample{Time: now, ProbeNotionalUSDT: 900, BuyImpactBPS: 4, SellImpactBPS: 4}, now, 24, 2)
+	if len(got) != 2 || got[0].BuyImpactBPS != 3 || got[1].BuyImpactBPS != 4 {
+		t.Fatalf("depth quote retention did not trim by window and cap: %+v", got)
+	}
+}
+
+type depthHistoryTestChain struct{ operationTestChain }
+
+func (c *depthHistoryTestChain) DepthCapacity(_ context.Context, t TokenConfig, _ Config) (float64, ChainQuote, error) {
+	return 900, ChainQuote{Symbol: t.Symbol, InputUSDT: 900, OutputTokens: 90, BuyPrice: 10, SellPrice: 9.99, RoundTripLossBPS: 10, BuyPriceImpactBPS: 10, SellPriceImpactBPS: 12}, nil
+}
+
+func (c *depthHistoryTestChain) BestQuote(_ context.Context, t TokenConfig, notional, _ float64) (ChainQuote, error) {
+	return ChainQuote{Symbol: t.Symbol, InputUSDT: notional, OutputTokens: notional / 10, BuyPrice: 10, SellPrice: 9.99, RoundTripLossBPS: 10, BuyPriceImpactBPS: 5, SellPriceImpactBPS: 6}, nil
+}
+
+func TestCandidateScanUsesSavedQuotesForImmediateQuarterEntry(t *testing.T) {
+	now := time.Now()
+	cfg := Config{
+		Binance: BinanceConfig{TakerFeeBPS: 1},
+		BSC:     BSCConfig{GasReserveUSDT: .1},
+		Strategy: StrategyConfig{
+			MaxQuoteCandidates:                 40,
+			MinCurrentFundingBPS:               5,
+			DepthHistoryProbeMinBPS:            1,
+			MinFundingAPRPercent:               20,
+			FundingIntervalsPerYear:            1095,
+			MinFundingHistorySamples:           3,
+			MinPositiveFundingRatio:            .7,
+			MaxCurrentToMedianRatio:            3,
+			EvaluationHoldHours:                720,
+			MaxEntryPaybackDays:                30,
+			MaxEntryBasisBPS:                   100,
+			MinCostCoverageRatio:               1,
+			DepthHistoryWindowHours:            24,
+			DepthHistoryMaxSamples:             48,
+			DepthHistoryHalfSamples:            12,
+			DepthHistoryFullSamples:            24,
+			DepthHistoryMinSpanMinutes:         180,
+			DepthHistoryMinPassRatio:           .85,
+			DepthHistoryColdStartConfirmations: 3,
+		},
+		Risk: RiskConfig{TotalCapitalUSDT: 10000, TargetNotionalPerCoinUSDT: 300, MaxNotionalPerCoinUSDT: 500, MaxCapitalPerCoinPercent: 5, DepthSafetyMultiplier: 3, MaxEntryChainPriceImpactBPS: 20, MaxChainPriceImpactBPS: 35, ReferenceQuoteUSDT: 10, MaxDataAgeSeconds: 120},
+	}
+	e := &Engine{
+		cfg:   cfg,
+		chain: &depthHistoryTestChain{},
+		state: &BotState{
+			Positions:    map[string]*Position{},
+			FundingStats: map[string]FundingStats{"CAKEUSDT": {Samples: 30, Median30DAPRPercent: 25, PositiveRatio: 1, ConservativeAPRPercent: 30}},
+			DepthQuoteHistory: map[string][]DepthQuoteSample{"CAKEUSDT": {
+				{Time: now.Add(-20 * time.Minute), ProbeNotionalUSDT: 900, BuyImpactBPS: 9, SellImpactBPS: 11},
+				{Time: now.Add(-10 * time.Minute), ProbeNotionalUSDT: 900, BuyImpactBPS: 10, SellImpactBPS: 12},
+			}},
+		},
+		tokens:       map[string]TokenConfig{"CAKEUSDT": {Symbol: "CAKE", BinanceSymbol: "CAKEUSDT", MaxNotionalUSDT: 500}},
+		fundingHours: map[string]float64{"CAKEUSDT": 8},
+	}
+	opps, err := e.scanOpportunities(context.Background(), map[string]FundingMarket{"CAKEUSDT": {Symbol: "CAKEUSDT", MarkPrice: 10, IndexPrice: 10, FundingRate: .0006, UpdatedAt: now}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opps) != 1 || math.Abs(opps[0].TargetNotionalUSDT-75) > 1e-9 || opps[0].DepthHistory.Stage != "quarter" || len(e.state.DepthQuoteHistory["CAKEUSDT"]) != 3 {
+		t.Fatalf("saved depth history did not produce the staged opportunity: %+v history=%+v", opps, e.state.DepthQuoteHistory["CAKEUSDT"])
+	}
+}
+
 func TestPaperFundingAccruesOnlyExactSettlementsOnce(t *testing.T) {
 	opened := time.Date(2026, 9, 27, 1, 0, 0, 0, time.UTC)
 	settlement := time.Date(2026, 9, 27, 8, 0, 0, 0, time.UTC)

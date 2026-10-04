@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ type operationTestBinance struct {
 	calls          []string
 	compensateFail bool
 	risks          map[string]PositionRisk
+	fillPrice      float64
 }
 
 func (b *operationTestBinance) RateLimitUntil() time.Time { return time.Time{} }
@@ -43,7 +45,11 @@ func (b *operationTestBinance) MarketOrder(_ context.Context, _ string, side str
 	if side == "SELL" && b.compensateFail {
 		return OrderFill{}, errors.New("compensation rejected")
 	}
-	return OrderFill{ExecutedQty: qty, AvgPrice: 1}, nil
+	price := b.fillPrice
+	if price == 0 {
+		price = 1
+	}
+	return OrderFill{ExecutedQty: qty, AvgPrice: price}, nil
 }
 func (b *operationTestBinance) MarketOrderTracked(ctx context.Context, symbol, side string, qty float64, reduceOnly bool, clientID string) (OrderFill, error) {
 	fill, err := b.MarketOrder(ctx, symbol, side, qty, reduceOnly)
@@ -59,6 +65,32 @@ type operationTestChain struct {
 	sellOut  float64
 	balance  float64
 	txStatus string
+}
+
+type stagedIncreaseTestChain struct {
+	operationTestChain
+	tokenAddress string
+	tokenBalance float64
+}
+
+func (c *stagedIncreaseTestChain) BestQuote(_ context.Context, t TokenConfig, notional, _ float64) (ChainQuote, error) {
+	return ChainQuote{Symbol: t.Symbol, InputUSDT: notional, OutputTokens: notional / 10, BuyPrice: 10, SellPrice: 9.99, BuyPriceImpactBPS: 5, SellPriceImpactBPS: 6}, nil
+}
+
+func (c *stagedIncreaseTestChain) Balance(_ context.Context, address string, _ uint8) (float64, error) {
+	if strings.EqualFold(address, c.tokenAddress) {
+		return c.tokenBalance, nil
+	}
+	return 1000, nil
+}
+
+func (c *stagedIncreaseTestChain) SwapExactInputTracked(_ context.Context, _, _ string, _, _ uint8, input, minOutput float64, onBroadcast func(common.Hash) error) (float64, common.Hash, error) {
+	hash := common.HexToHash("0x1234")
+	if err := onBroadcast(hash); err != nil {
+		return 0, hash, err
+	}
+	c.tokenBalance += minOutput
+	return input, hash, nil
 }
 
 type paginationBinance struct {
@@ -144,6 +176,109 @@ func operationTestEngine(t *testing.T, compensateFail bool) (*Engine, *operation
 		symbols: map[string]BinanceSymbol{"CAKEUSDT": {Symbol: "CAKEUSDT", StepSize: .001, MinQty: .001}},
 	}
 	return e, b
+}
+
+func TestRebalanceIncreasesProbePositionWhenDepthHistoryMatures(t *testing.T) {
+	now := time.Now()
+	e := &Engine{
+		cfg: Config{
+			Mode:     "paper",
+			StateDir: t.TempDir(),
+			Strategy: StrategyConfig{TargetPositions: 25, EntryConfirmationScans: 1},
+			Risk:     RiskConfig{TotalCapitalUSDT: 1000, MaxDataAgeSeconds: 120, ReferenceQuoteUSDT: 10, MaxEntryChainPriceImpactBPS: 20},
+		},
+		chain: &depthHistoryTestChain{},
+		alert: NewAlerter(AlertConfig{}),
+		state: &BotState{
+			Positions:          map[string]*Position{"CAKEUSDT": {Symbol: "CAKEUSDT", TokenAddress: "0x1111111111111111111111111111111111111111", TokenDecimals: 18, TokenQty: 7.5, SpotCostUSDT: 75, ShortQty: 7.5, ShortEntryPrice: 10, OpenedAt: now.Add(-time.Hour), DepthHistoryStage: "quarter"}},
+			EntryConfirmations: map[string]int{},
+			CooldownUntil:      map[string]time.Time{},
+			PendingOperations:  map[string]*PendingOperation{},
+		},
+		tokens:  map[string]TokenConfig{"CAKEUSDT": {Symbol: "CAKE", BinanceSymbol: "CAKEUSDT", BSCAddress: "0x1111111111111111111111111111111111111111", Decimals: 18}},
+		symbols: map[string]BinanceSymbol{"CAKEUSDT": {Symbol: "CAKEUSDT", StepSize: .001, MinQty: .001}},
+	}
+	market := FundingMarket{Symbol: "CAKEUSDT", MarkPrice: 10, IndexPrice: 10, UpdatedAt: now}
+	opportunity := Opportunity{Symbol: "CAKEUSDT", TargetNotionalUSDT: 150, FullTargetNotionalUSDT: 300, FundingAPRPercent: 30, Chain: ChainQuote{InputUSDT: 150, OutputTokens: 15, BuyPrice: 10, BuyPriceImpactBPS: 5, SellPriceImpactBPS: 6}, Market: market, DepthHistory: DepthHistoryAssessment{Stage: "half", AllocationFraction: .5}}
+	e.rebalance(context.Background(), now, map[string]FundingMarket{"CAKEUSDT": market}, []Opportunity{opportunity})
+	p := e.state.Positions["CAKEUSDT"]
+	if p == nil || math.Abs(p.SpotCostUSDT-150) > 1e-9 || math.Abs(p.TokenQty-15) > 1e-9 || math.Abs(p.ShortQty-15) > 1e-9 {
+		t.Fatalf("mature depth history did not scale the existing probe position: %+v", p)
+	}
+	if p.DepthHistoryStage != "half" {
+		t.Fatalf("mature depth history stage was not saved: %+v", p)
+	}
+}
+
+func TestRebalanceDoesNotRegrowLegacyDepthReducedPosition(t *testing.T) {
+	now := time.Now()
+	e := &Engine{
+		cfg: Config{
+			Mode:     "paper",
+			StateDir: t.TempDir(),
+			Strategy: StrategyConfig{TargetPositions: 25, EntryConfirmationScans: 1},
+			Risk:     RiskConfig{TotalCapitalUSDT: 1000, MaxDataAgeSeconds: 120, ReferenceQuoteUSDT: 10, MaxEntryChainPriceImpactBPS: 20},
+		},
+		chain: &depthHistoryTestChain{},
+		alert: NewAlerter(AlertConfig{}),
+		state: &BotState{
+			Positions:          map[string]*Position{"CAKEUSDT": {Symbol: "CAKEUSDT", TokenAddress: "0x1111111111111111111111111111111111111111", TokenDecimals: 18, TokenQty: 7.5, SpotCostUSDT: 75, ShortQty: 7.5, ShortEntryPrice: 10, OpenedAt: now.Add(-time.Hour)}},
+			EntryConfirmations: map[string]int{},
+			CooldownUntil:      map[string]time.Time{},
+			PendingOperations:  map[string]*PendingOperation{},
+		},
+		tokens:  map[string]TokenConfig{"CAKEUSDT": {Symbol: "CAKE", BinanceSymbol: "CAKEUSDT", BSCAddress: "0x1111111111111111111111111111111111111111", Decimals: 18}},
+		symbols: map[string]BinanceSymbol{"CAKEUSDT": {Symbol: "CAKEUSDT", StepSize: .001, MinQty: .001}},
+	}
+	market := FundingMarket{Symbol: "CAKEUSDT", MarkPrice: 10, IndexPrice: 10, UpdatedAt: now}
+	opportunity := Opportunity{Symbol: "CAKEUSDT", TargetNotionalUSDT: 150, FullTargetNotionalUSDT: 300, FundingAPRPercent: 30, Chain: ChainQuote{InputUSDT: 150, OutputTokens: 15, BuyPrice: 10, BuyPriceImpactBPS: 5, SellPriceImpactBPS: 6}, Market: market, DepthHistory: DepthHistoryAssessment{Stage: "half", AllocationFraction: .5}}
+	e.rebalance(context.Background(), now, map[string]FundingMarket{"CAKEUSDT": market}, []Opportunity{opportunity})
+	p := e.state.Positions["CAKEUSDT"]
+	if p == nil || math.Abs(p.SpotCostUSDT-75) > 1e-9 {
+		t.Fatalf("legacy reduced position was incorrectly regrown: %+v", p)
+	}
+}
+
+func TestLiveDepthStageIncreaseCombinesBothLegsAndClearsJournal(t *testing.T) {
+	address := "0x1111111111111111111111111111111111111111"
+	b := &operationTestBinance{fillPrice: 10}
+	c := &stagedIncreaseTestChain{tokenAddress: address, tokenBalance: 7.5}
+	now := time.Now()
+	p := &Position{Symbol: "CAKEUSDT", TokenAddress: address, TokenDecimals: 18, TokenQty: 7.5, SpotCostUSDT: 75, ShortQty: 7.5, ShortEntryPrice: 10, OpenedAt: now.Add(-time.Hour), DepthHistoryStage: "quarter"}
+	e := &Engine{
+		cfg:                Config{Mode: "live", StateDir: t.TempDir(), Binance: BinanceConfig{Leverage: 5}, BSC: BSCConfig{USDTAddress: "0x55d398326f99059ff775485246999027b3197955", USDTDecimals: 18}, Strategy: StrategyConfig{MaxEntryBasisBPS: 100}, Risk: RiskConfig{TotalCapitalUSDT: 1000, ReferenceQuoteUSDT: 10, MaxEntryChainPriceImpactBPS: 20, MaxFuturesMarginUsePercent: 100}},
+		binance:            b,
+		chain:              c,
+		alert:              NewAlerter(AlertConfig{}),
+		state:              &BotState{Version: currentStateVersion, Positions: map[string]*Position{"CAKEUSDT": p}, PendingOperations: map[string]*PendingOperation{}},
+		tokens:             map[string]TokenConfig{"CAKEUSDT": {Symbol: "CAKE", BinanceSymbol: "CAKEUSDT", BSCAddress: address, Decimals: 18}},
+		symbols:            map[string]BinanceSymbol{"CAKEUSDT": {Symbol: "CAKEUSDT", StepSize: .001, MinQty: .001}},
+		accountRisk:        FuturesAccountRisk{AvailableBalance: 1000},
+		chainAvailableUSDT: 1000,
+	}
+	o := Opportunity{Symbol: "CAKEUSDT", TargetNotionalUSDT: 150, Market: FundingMarket{MarkPrice: 10}, DepthHistory: DepthHistoryAssessment{Stage: "half", AllocationFraction: .5}}
+	if err := e.increasePosition(context.Background(), p, o, "depth_history_stage_half"); err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(p.SpotCostUSDT-150) > 1e-9 || math.Abs(p.TokenQty-15) > 1e-9 || math.Abs(p.ShortQty-15) > 1e-9 || p.DepthHistoryStage != "half" || len(e.state.PendingOperations) != 0 || len(b.calls) != 1 || b.calls[0] != "SELL" {
+		t.Fatalf("live staged increase was not atomically reflected: position=%+v pending=%+v calls=%v", p, e.state.PendingOperations, b.calls)
+	}
+}
+
+func TestStartupRecoveryCompletesConfirmedDepthStageIncrease(t *testing.T) {
+	e, b := operationTestEngine(t, false)
+	e.chain = &operationTestChain{balance: 15, txStatus: "success"}
+	b.risks = map[string]PositionRisk{"CAKEUSDT": {Symbol: "CAKEUSDT", PositionAmount: -15, EntryPrice: 10, MarkPrice: 10}}
+	p := &Position{Symbol: "CAKEUSDT", TokenAddress: "0x1111111111111111111111111111111111111111", TokenDecimals: 18, TokenQty: 7.5, SpotCostUSDT: 75, ShortQty: 7.5, ShortEntryPrice: 10, OpenedAt: time.Now().Add(-time.Hour), DepthHistoryStage: "quarter"}
+	e.state.Positions[p.Symbol] = p
+	op := &PendingOperation{ID: "increase-1", Kind: "increase", Stage: "futures_status_unknown", Symbol: p.Symbol, TokenAddress: p.TokenAddress, TokenDecimals: p.TokenDecimals, BalanceBefore: 7.5, BalanceAfter: 15, ChainTxHash: common.HexToHash("0x1234").Hex(), OriginalTokenQty: 7.5, OriginalShortQty: 7.5, OriginalSpotCostUSDT: 75, OriginalShortEntryPrice: 10, TargetNotionalUSDT: 75, PlannedTokenQty: 7.5, PlannedFuturesQty: 7.5, DepthHistoryStage: "half", CreatedAt: time.Now().Add(-time.Minute), UpdatedAt: time.Now()}
+	e.state.PendingOperations[op.ID] = op
+	if err := e.recoverPendingOperations(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(p.SpotCostUSDT-150) > 1e-9 || math.Abs(p.TokenQty-15) > 1e-9 || math.Abs(p.ShortQty-15) > 1e-9 || p.DepthHistoryStage != "half" || len(e.state.PendingOperations) != 0 {
+		t.Fatalf("confirmed staged increase was not recovered: position=%+v pending=%+v", p, e.state.PendingOperations)
+	}
 }
 
 func TestLiveReductionRestoresFuturesWhenSpotLegFails(t *testing.T) {

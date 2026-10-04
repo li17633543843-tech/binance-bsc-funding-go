@@ -35,17 +35,118 @@ type FundingStats struct {
 	ObservedNextFundingTime  time.Time `json:"observed_next_funding_time"`
 }
 
+// DepthQuoteSample is one real, executable OKX round-trip quote observed by
+// the bot. Samples are persisted so a funding signal can use depth measured
+// before the signal appeared instead of starting a new 24-hour wait.
+type DepthQuoteSample struct {
+	Time              time.Time `json:"time"`
+	ProbeNotionalUSDT float64   `json:"probe_notional_usdt"`
+	BuyImpactBPS      float64   `json:"buy_impact_bps"`
+	SellImpactBPS     float64   `json:"sell_impact_bps"`
+	Passed            bool      `json:"passed"`
+}
+
+type DepthHistoryAssessment struct {
+	SampleCount        int     `json:"sample_count"`
+	PassRatio          float64 `json:"pass_ratio"`
+	SpanHours          float64 `json:"span_hours"`
+	BuyP90BPS          float64 `json:"buy_p90_bps"`
+	SellP90BPS         float64 `json:"sell_p90_bps"`
+	ConsecutivePasses  int     `json:"consecutive_passes"`
+	AllocationFraction float64 `json:"allocation_fraction"`
+	Stage              string  `json:"stage"`
+	Reason             string  `json:"reason,omitempty"`
+}
+
+func RecordDepthQuote(history []DepthQuoteSample, sample DepthQuoteSample, now time.Time, windowHours, maxSamples int) []DepthQuoteSample {
+	cutoff := now.Add(-time.Duration(windowHours) * time.Hour)
+	out := make([]DepthQuoteSample, 0, len(history)+1)
+	for _, existing := range history {
+		if !existing.Time.Before(cutoff) && !existing.Time.After(now.Add(time.Minute)) {
+			out = append(out, existing)
+		}
+	}
+	out = append(out, sample)
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	if maxSamples > 0 && len(out) > maxSamples {
+		out = append([]DepthQuoteSample(nil), out[len(out)-maxSamples:]...)
+	}
+	return out
+}
+
+// AssessDepthQuoteHistory turns persisted executable quotes into a staged
+// entry allowance. Once enough history exists, poor history cannot be hidden
+// by three recent good quotes.
+func AssessDepthQuoteHistory(samples []DepthQuoteSample, now time.Time, strategy StrategyConfig, maxImpactBPS float64) DepthHistoryAssessment {
+	cutoff := now.Add(-time.Duration(strategy.DepthHistoryWindowHours) * time.Hour)
+	valid := make([]DepthQuoteSample, 0, len(samples))
+	for _, sample := range samples {
+		if sample.Time.IsZero() || sample.Time.Before(cutoff) || sample.Time.After(now.Add(time.Minute)) || sample.ProbeNotionalUSDT <= 0 || math.IsNaN(sample.BuyImpactBPS) || math.IsInf(sample.BuyImpactBPS, 0) || math.IsNaN(sample.SellImpactBPS) || math.IsInf(sample.SellImpactBPS, 0) {
+			continue
+		}
+		valid = append(valid, sample)
+	}
+	sort.Slice(valid, func(i, j int) bool { return valid[i].Time.Before(valid[j].Time) })
+	a := DepthHistoryAssessment{SampleCount: len(valid), Stage: "warming", Reason: "insufficient executable quote history"}
+	if len(valid) == 0 {
+		return a
+	}
+	buys, sells := make([]float64, 0, len(valid)), make([]float64, 0, len(valid))
+	passed := 0
+	for _, sample := range valid {
+		buys = append(buys, sample.BuyImpactBPS)
+		sells = append(sells, sample.SellImpactBPS)
+		if sample.BuyImpactBPS <= maxImpactBPS && sample.SellImpactBPS <= maxImpactBPS {
+			passed++
+		}
+	}
+	for i := len(valid) - 1; i >= 0; i-- {
+		if valid[i].BuyImpactBPS > maxImpactBPS || valid[i].SellImpactBPS > maxImpactBPS {
+			break
+		}
+		a.ConsecutivePasses++
+	}
+	sort.Float64s(buys)
+	sort.Float64s(sells)
+	a.PassRatio = float64(passed) / float64(len(valid))
+	a.BuyP90BPS = quantileSorted(buys, .9)
+	a.SellP90BPS = quantileSorted(sells, .9)
+	if len(valid) > 1 {
+		a.SpanHours = valid[len(valid)-1].Time.Sub(valid[0].Time).Hours()
+	}
+	qualityOK := a.PassRatio >= strategy.DepthHistoryMinPassRatio && a.BuyP90BPS <= maxImpactBPS && a.SellP90BPS <= maxImpactBPS && a.ConsecutivePasses > 0
+	if len(valid) >= strategy.DepthHistoryHalfSamples && !qualityOK {
+		a.Stage = "rejected"
+		a.Reason = "historical two-sided depth quality is below the configured floor"
+		return a
+	}
+	minSpanHours := float64(strategy.DepthHistoryMinSpanMinutes) / 60
+	if len(valid) >= strategy.DepthHistoryFullSamples && a.SpanHours+1e-9 >= minSpanHours && qualityOK {
+		a.Stage, a.AllocationFraction, a.Reason = "full", 1, "mature two-sided depth history"
+		return a
+	}
+	if len(valid) >= strategy.DepthHistoryHalfSamples && a.SpanHours+1e-9 >= minSpanHours/2 && qualityOK {
+		a.Stage, a.AllocationFraction, a.Reason = "half", .5, "developing two-sided depth history"
+		return a
+	}
+	if a.ConsecutivePasses >= strategy.DepthHistoryColdStartConfirmations {
+		a.Stage, a.AllocationFraction, a.Reason = "quarter", .25, "cold-start probe position"
+	}
+	return a
+}
+
 type FundingWatch struct {
-	Symbol            string    `json:"symbol"`
-	BaseAsset         string    `json:"base_asset"`
-	FundingBPS        float64   `json:"funding_bps_per_interval"`
-	SimpleAPRPercent  float64   `json:"simple_apr_percent"`
-	MarkPrice         float64   `json:"mark_price"`
-	NextFundingTime   time.Time `json:"next_funding_time"`
-	BSCSpotMatched    bool      `json:"bsc_spot_matched"`
-	BSCAddress        string    `json:"bsc_address,omitempty"`
-	BSCMatchStatus    string    `json:"bsc_match_status,omitempty"`
-	EligibleForQuotes bool      `json:"eligible_for_okx_quotes"`
+	Symbol            string                 `json:"symbol"`
+	BaseAsset         string                 `json:"base_asset"`
+	FundingBPS        float64                `json:"funding_bps_per_interval"`
+	SimpleAPRPercent  float64                `json:"simple_apr_percent"`
+	MarkPrice         float64                `json:"mark_price"`
+	NextFundingTime   time.Time              `json:"next_funding_time"`
+	BSCSpotMatched    bool                   `json:"bsc_spot_matched"`
+	BSCAddress        string                 `json:"bsc_address,omitempty"`
+	BSCMatchStatus    string                 `json:"bsc_match_status,omitempty"`
+	EligibleForQuotes bool                   `json:"eligible_for_okx_quotes"`
+	DepthHistory      DepthHistoryAssessment `json:"depth_history"`
 }
 
 type ChainQuote struct {
@@ -65,24 +166,26 @@ type ChainQuote struct {
 }
 
 type Opportunity struct {
-	Symbol              string        `json:"symbol"`
-	FundingBPS          float64       `json:"funding_bps_per_interval"`
-	FundingAPRPercent   float64       `json:"funding_apr_percent"`
-	Median7DAPRPercent  float64       `json:"median_7d_apr_percent"`
-	Median30DAPRPercent float64       `json:"median_30d_apr_percent"`
-	PositiveFundingRate float64       `json:"positive_funding_ratio"`
-	FundingSamples      int           `json:"funding_history_samples"`
-	NetAPRPercent       float64       `json:"net_apr_percent"`
-	EntryCostUSDT       float64       `json:"entry_cost_usdt"`
-	EntryBasisBPS       float64       `json:"entry_basis_bps"`
-	BasisCostUSDT       float64       `json:"basis_cost_usdt"`
-	RoundTripCostUSDT   float64       `json:"round_trip_cost_usdt"`
-	ExpectedHoldProfit  float64       `json:"expected_hold_profit_usdt"`
-	PaybackDays         float64       `json:"payback_days"`
-	TargetNotionalUSDT  float64       `json:"target_notional_usdt"`
-	MaxSafeNotionalUSDT float64       `json:"max_safe_notional_usdt"`
-	Chain               ChainQuote    `json:"chain"`
-	Market              FundingMarket `json:"market"`
+	Symbol                 string                 `json:"symbol"`
+	FundingBPS             float64                `json:"funding_bps_per_interval"`
+	FundingAPRPercent      float64                `json:"funding_apr_percent"`
+	Median7DAPRPercent     float64                `json:"median_7d_apr_percent"`
+	Median30DAPRPercent    float64                `json:"median_30d_apr_percent"`
+	PositiveFundingRate    float64                `json:"positive_funding_ratio"`
+	FundingSamples         int                    `json:"funding_history_samples"`
+	NetAPRPercent          float64                `json:"net_apr_percent"`
+	EntryCostUSDT          float64                `json:"entry_cost_usdt"`
+	EntryBasisBPS          float64                `json:"entry_basis_bps"`
+	BasisCostUSDT          float64                `json:"basis_cost_usdt"`
+	RoundTripCostUSDT      float64                `json:"round_trip_cost_usdt"`
+	ExpectedHoldProfit     float64                `json:"expected_hold_profit_usdt"`
+	PaybackDays            float64                `json:"payback_days"`
+	TargetNotionalUSDT     float64                `json:"target_notional_usdt"`
+	FullTargetNotionalUSDT float64                `json:"full_target_notional_usdt"`
+	MaxSafeNotionalUSDT    float64                `json:"max_safe_notional_usdt"`
+	DepthHistory           DepthHistoryAssessment `json:"depth_history"`
+	Chain                  ChainQuote             `json:"chain"`
+	Market                 FundingMarket          `json:"market"`
 }
 
 type Position struct {
@@ -99,6 +202,10 @@ type Position struct {
 	LastFundingTime           time.Time `json:"last_funding_time"`
 	LastFundingAssessmentTime time.Time `json:"last_funding_assessment_time,omitempty"`
 	RealizedPnLUSDT           float64   `json:"realized_pnl_usdt"`
+	// DepthHistoryStage is set only for positions created by the staged
+	// historical-depth entry path. Empty means a legacy/manual position and
+	// prevents a later scan from undoing a deliberate risk reduction.
+	DepthHistoryStage string `json:"depth_history_stage,omitempty"`
 }
 
 // PendingOperation is the durable journal for an exchange/chain action that may
@@ -123,6 +230,9 @@ type PendingOperation struct {
 	TargetNotionalUSDT        float64   `json:"target_notional_usdt,omitempty"`
 	OriginalTokenQty          float64   `json:"original_token_qty,omitempty"`
 	OriginalShortQty          float64   `json:"original_short_qty,omitempty"`
+	OriginalSpotCostUSDT      float64   `json:"original_spot_cost_usdt,omitempty"`
+	OriginalShortEntryPrice   float64   `json:"original_short_entry_price,omitempty"`
+	DepthHistoryStage         string    `json:"depth_history_stage,omitempty"`
 	ChainTxHash               string    `json:"chain_tx_hash,omitempty"`
 	CompensationChainTxHash   string    `json:"compensation_chain_tx_hash,omitempty"`
 	BalanceBefore             float64   `json:"balance_before,omitempty"`
@@ -157,26 +267,27 @@ type FuturesAccountRisk struct {
 }
 
 type BotState struct {
-	Version                  int                          `json:"version"`
-	StartedAt                time.Time                    `json:"started_at"`
-	UpdatedAt                time.Time                    `json:"updated_at"`
-	Positions                map[string]*Position         `json:"positions"`
-	FundingEWMA              map[string]float64           `json:"funding_ewma"`
-	FundingSamples           map[string]int               `json:"funding_samples"`
-	WeakFundingScans         map[string]int               `json:"weak_funding_scans"`
-	FundingHistory           map[string][]FundingRecord   `json:"funding_history,omitempty"`
-	FundingStats             map[string]FundingStats      `json:"funding_stats,omitempty"`
-	WeakFundingSettlements   map[string]int               `json:"weak_funding_settlements,omitempty"`
-	EntryConfirmations       map[string]int               `json:"entry_confirmations,omitempty"`
-	CooldownUntil            map[string]time.Time         `json:"cooldown_until"`
-	DepthBreachScans         map[string]int               `json:"depth_breach_scans"`
-	LiquidationBreachScans   map[string]int               `json:"liquidation_breach_scans,omitempty"`
-	RiskReduceCooldownUntil  time.Time                    `json:"risk_reduce_cooldown_until,omitempty"`
-	AccountMarginBreachScans int                          `json:"account_margin_breach_scans,omitempty"`
-	DailyRealizedPnL         float64                      `json:"daily_realized_pnl_usdt"`
-	DailyDate                string                       `json:"daily_date"`
-	ConsecutiveFailures      int                          `json:"consecutive_failures"`
-	PendingOperations        map[string]*PendingOperation `json:"pending_operations,omitempty"`
+	Version                  int                           `json:"version"`
+	StartedAt                time.Time                     `json:"started_at"`
+	UpdatedAt                time.Time                     `json:"updated_at"`
+	Positions                map[string]*Position          `json:"positions"`
+	FundingEWMA              map[string]float64            `json:"funding_ewma"`
+	FundingSamples           map[string]int                `json:"funding_samples"`
+	WeakFundingScans         map[string]int                `json:"weak_funding_scans"`
+	FundingHistory           map[string][]FundingRecord    `json:"funding_history,omitempty"`
+	FundingStats             map[string]FundingStats       `json:"funding_stats,omitempty"`
+	DepthQuoteHistory        map[string][]DepthQuoteSample `json:"depth_quote_history,omitempty"`
+	WeakFundingSettlements   map[string]int                `json:"weak_funding_settlements,omitempty"`
+	EntryConfirmations       map[string]int                `json:"entry_confirmations,omitempty"`
+	CooldownUntil            map[string]time.Time          `json:"cooldown_until"`
+	DepthBreachScans         map[string]int                `json:"depth_breach_scans"`
+	LiquidationBreachScans   map[string]int                `json:"liquidation_breach_scans,omitempty"`
+	RiskReduceCooldownUntil  time.Time                     `json:"risk_reduce_cooldown_until,omitempty"`
+	AccountMarginBreachScans int                           `json:"account_margin_breach_scans,omitempty"`
+	DailyRealizedPnL         float64                       `json:"daily_realized_pnl_usdt"`
+	DailyDate                string                        `json:"daily_date"`
+	ConsecutiveFailures      int                           `json:"consecutive_failures"`
+	PendingOperations        map[string]*PendingOperation  `json:"pending_operations,omitempty"`
 }
 
 type EntryEconomics struct {

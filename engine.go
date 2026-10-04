@@ -318,7 +318,7 @@ func (e *Engine) enrichDiscoveryFromSearch(ctx context.Context, markets map[stri
 	var candidates []candidate
 	for symbol, market := range markets {
 		rule, ok := e.symbols[symbol]
-		if !ok || market.FundingRate*10000 < e.cfg.Strategy.MinCurrentFundingBPS || denied[rule.Base] {
+		if !ok || market.FundingRate*10000 < e.cfg.Strategy.DepthHistoryProbeMinBPS || denied[rule.Base] {
 			continue
 		}
 		if _, matched := e.tokens[symbol]; matched {
@@ -430,7 +430,12 @@ func (e *Engine) updateFundingWatch(markets map[string]FundingMarket) {
 		if matched && status == "" {
 			status = "catalog_or_manual_match"
 		}
-		watch = append(watch, FundingWatch{Symbol: symbol, BaseAsset: binanceToken.Base, FundingBPS: fundingBPS, SimpleAPRPercent: annualizedFundingPercent(market.FundingRate, e.intervalsPerYear(symbol)), MarkPrice: market.MarkPrice, NextFundingTime: market.NextFundingTime, BSCSpotMatched: matched, BSCAddress: token.BSCAddress, BSCMatchStatus: status, EligibleForQuotes: matched})
+		var depthSamples []DepthQuoteSample
+		if e.state != nil {
+			depthSamples = e.state.DepthQuoteHistory[symbol]
+		}
+		depthHistory := AssessDepthQuoteHistory(depthSamples, time.Now(), e.cfg.Strategy, e.cfg.Risk.MaxEntryChainPriceImpactBPS)
+		watch = append(watch, FundingWatch{Symbol: symbol, BaseAsset: binanceToken.Base, FundingBPS: fundingBPS, SimpleAPRPercent: annualizedFundingPercent(market.FundingRate, e.intervalsPerYear(symbol)), MarkPrice: market.MarkPrice, NextFundingTime: market.NextFundingTime, BSCSpotMatched: matched, BSCAddress: token.BSCAddress, BSCMatchStatus: status, EligibleForQuotes: matched, DepthHistory: depthHistory})
 	}
 	sort.Slice(watch, func(i, j int) bool {
 		if watch[i].FundingBPS == watch[j].FundingBPS {
@@ -524,10 +529,11 @@ func (e *Engine) runCycle(ctx context.Context) {
 		opps, scanErr := e.scanOpportunities(ctx, markets)
 		if scanErr != nil {
 			slog.Warn("candidate scan partially failed", "error", scanErr)
-			e.nextChainScan = time.Now().Add(5 * time.Minute)
-		} else {
-			e.nextChainScan = time.Now().Add(time.Duration(e.cfg.Strategy.ChainQuoteRefreshMinutes) * time.Minute)
 		}
+		// Partial quote failures must not turn into a five-minute retry storm.
+		// Keep the configured low-frequency cadence so a transient OKX limit or
+		// one illiquid token cannot amplify into global 429 responses.
+		e.nextChainScan = time.Now().Add(time.Duration(e.cfg.Strategy.ChainQuoteRefreshMinutes) * time.Minute)
 		ranked := rankOpportunities(opps)
 		if scanErr == nil && len(e.state.PendingOperations) == 0 {
 			e.manageSpreadProfitRotations(ctx, now, markets, ranked)
@@ -1057,13 +1063,15 @@ func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]Fundi
 		apr    float64
 	}
 	type result struct {
-		o   Opportunity
-		err error
+		o      Opportunity
+		symbol string
+		sample *DepthQuoteSample
+		err    error
 	}
 	var candidates []candidate
 	for symbol, token := range e.tokens {
 		m, ok := markets[symbol]
-		if !ok || m.UpdatedAt.IsZero() || now.Sub(m.UpdatedAt) > time.Duration(e.cfg.Risk.MaxDataAgeSeconds)*time.Second || m.FundingRate*10000 < e.cfg.Strategy.MinCurrentFundingBPS {
+		if !ok || m.UpdatedAt.IsZero() || now.Sub(m.UpdatedAt) > time.Duration(e.cfg.Risk.MaxDataAgeSeconds)*time.Second || m.FundingRate*10000 < e.cfg.Strategy.DepthHistoryProbeMinBPS {
 			continue
 		}
 		stats := e.state.FundingStats[token.BinanceSymbol]
@@ -1102,25 +1110,34 @@ func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]Fundi
 				results <- result{err: fmt.Errorf("%s: %w", t.Symbol, err)}
 				return
 			}
+			sample := DepthQuoteSample{Time: now, ProbeNotionalUSDT: q.InputUSDT, BuyImpactBPS: q.BuyPriceImpactBPS, SellImpactBPS: q.SellPriceImpactBPS, Passed: q.BuyPriceImpactBPS <= e.cfg.Risk.MaxEntryChainPriceImpactBPS && q.SellPriceImpactBPS <= e.cfg.Risk.MaxEntryChainPriceImpactBPS}
+			history := RecordDepthQuote(e.state.DepthQuoteHistory[t.BinanceSymbol], sample, now, e.cfg.Strategy.DepthHistoryWindowHours, e.cfg.Strategy.DepthHistoryMaxSamples)
+			assessment := AssessDepthQuoteHistory(history, now, e.cfg.Strategy, e.cfg.Risk.MaxEntryChainPriceImpactBPS)
 			safe := maxSafeNotional(e.cfg, t, cap)
-			target := math.Min(e.cfg.Risk.TargetNotionalPerCoinUSDT, safe)
-			if target <= 0 {
+			fullTarget := math.Min(e.cfg.Risk.TargetNotionalPerCoinUSDT, safe)
+			if fullTarget <= 0 || market.FundingRate*10000 < e.cfg.Strategy.MinCurrentFundingBPS || assessment.AllocationFraction <= 0 {
+				results <- result{symbol: t.BinanceSymbol, sample: &sample}
 				return
 			}
+			target := fullTarget * assessment.AllocationFraction
 			if math.Abs(q.InputUSDT-target) > 1e-8 {
 				q, err = e.chain.BestQuote(ctx, t, target, e.cfg.Risk.ReferenceQuoteUSDT)
 				if err != nil {
-					results <- result{err: err}
+					results <- result{symbol: t.BinanceSymbol, sample: &sample, err: err}
 					return
 				}
 			}
+			if q.BuyPriceImpactBPS > e.cfg.Risk.MaxEntryChainPriceImpactBPS || q.SellPriceImpactBPS > e.cfg.Risk.MaxEntryChainPriceImpactBPS {
+				results <- result{symbol: t.BinanceSymbol, sample: &sample, err: fmt.Errorf("%s staged entry quote exceeds %.2f bps two-sided impact limit", t.Symbol, e.cfg.Risk.MaxEntryChainPriceImpactBPS)}
+				return
+			}
 			if market.MarkPrice <= 0 || q.BuyPrice <= 0 || math.Abs(q.BuyPrice/market.MarkPrice-1)*100 > maxTokenMatchPriceDeviationPercent {
-				results <- result{err: fmt.Errorf("%s BSC spot price %.8f does not match Binance mark price %.8f", t.Symbol, q.BuyPrice, market.MarkPrice)}
+				results <- result{symbol: t.BinanceSymbol, sample: &sample, err: fmt.Errorf("%s BSC spot price %.8f does not match Binance mark price %.8f", t.Symbol, q.BuyPrice, market.MarkPrice)}
 				return
 			}
 			basisBPS := (q.BuyPrice/market.MarkPrice - 1) * 10000
 			if math.Abs(basisBPS) > e.cfg.Strategy.MaxEntryBasisBPS {
-				results <- result{err: fmt.Errorf("%s entry basis %.2f bps exceeds %.2f bps limit", t.Symbol, basisBPS, e.cfg.Strategy.MaxEntryBasisBPS)}
+				results <- result{symbol: t.BinanceSymbol, sample: &sample, err: fmt.Errorf("%s entry basis %.2f bps exceeds %.2f bps limit", t.Symbol, basisBPS, e.cfg.Strategy.MaxEntryBasisBPS)}
 				return
 			}
 			chainLoss := target * q.RoundTripLossBPS / 10000
@@ -1133,10 +1150,11 @@ func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]Fundi
 				costCoverage = holdGross / economics.RoundTripCostUSDT
 			}
 			if apr < e.cfg.Strategy.MinFundingAPRPercent || economics.PaybackDays > e.cfg.Strategy.MaxEntryPaybackDays || economics.ExpectedHoldProfitUSDT <= 0 || costCoverage < e.cfg.Strategy.MinCostCoverageRatio {
+				results <- result{symbol: t.BinanceSymbol, sample: &sample}
 				return
 			}
 			stats := e.state.FundingStats[t.BinanceSymbol]
-			results <- result{o: Opportunity{Symbol: t.BinanceSymbol, FundingBPS: market.FundingRate * 10000, FundingAPRPercent: apr, Median7DAPRPercent: stats.Median7DAPRPercent, Median30DAPRPercent: stats.Median30DAPRPercent, PositiveFundingRate: stats.PositiveRatio, FundingSamples: stats.Samples, NetAPRPercent: economics.NetAPRPercent, EntryCostUSDT: chainLoss/2 + target*e.cfg.Binance.TakerFeeBPS/10000 + e.cfg.BSC.GasReserveUSDT/2 + economics.BasisCostUSDT, EntryBasisBPS: basisBPS, BasisCostUSDT: economics.BasisCostUSDT, RoundTripCostUSDT: economics.RoundTripCostUSDT, ExpectedHoldProfit: economics.ExpectedHoldProfitUSDT, PaybackDays: economics.PaybackDays, TargetNotionalUSDT: target, MaxSafeNotionalUSDT: safe, Chain: q, Market: market}}
+			results <- result{o: Opportunity{Symbol: t.BinanceSymbol, FundingBPS: market.FundingRate * 10000, FundingAPRPercent: apr, Median7DAPRPercent: stats.Median7DAPRPercent, Median30DAPRPercent: stats.Median30DAPRPercent, PositiveFundingRate: stats.PositiveRatio, FundingSamples: stats.Samples, NetAPRPercent: economics.NetAPRPercent, EntryCostUSDT: chainLoss/2 + target*e.cfg.Binance.TakerFeeBPS/10000 + e.cfg.BSC.GasReserveUSDT/2 + economics.BasisCostUSDT, EntryBasisBPS: basisBPS, BasisCostUSDT: economics.BasisCostUSDT, RoundTripCostUSDT: economics.RoundTripCostUSDT, ExpectedHoldProfit: economics.ExpectedHoldProfitUSDT, PaybackDays: economics.PaybackDays, TargetNotionalUSDT: target, FullTargetNotionalUSDT: fullTarget, MaxSafeNotionalUSDT: safe, DepthHistory: assessment, Chain: q, Market: market}, symbol: t.BinanceSymbol, sample: &sample}
 		}(item.token, item.market, item.apr)
 	}
 	wg.Wait()
@@ -1144,6 +1162,9 @@ func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]Fundi
 	var out []Opportunity
 	var first error
 	for r := range results {
+		if r.sample != nil && r.symbol != "" {
+			e.state.DepthQuoteHistory[r.symbol] = RecordDepthQuote(e.state.DepthQuoteHistory[r.symbol], *r.sample, now, e.cfg.Strategy.DepthHistoryWindowHours, e.cfg.Strategy.DepthHistoryMaxSamples)
+		}
 		if r.err != nil {
 			if first == nil {
 				first = r.err
@@ -1224,6 +1245,19 @@ func (e *Engine) rebalance(ctx context.Context, now time.Time, markets map[strin
 		}
 		return
 	}
+	// Grow cold-start probe positions only when the persisted depth history has
+	// advanced to a larger stage. The opportunity target is the total desired
+	// notional, so repeated scans cannot add the same layer twice.
+	for _, o := range opps {
+		p := e.state.Positions[o.Symbol]
+		if p == nil || depthHistoryStageRank(p.DepthHistoryStage) == 0 || depthHistoryStageRank(o.DepthHistory.Stage) <= depthHistoryStageRank(p.DepthHistoryStage) || o.TargetNotionalUSDT <= p.SpotCostUSDT+math.Max(.01, p.SpotCostUSDT*.01) {
+			continue
+		}
+		if err := e.increasePosition(ctx, p, o, "depth_history_stage_"+o.DepthHistory.Stage); err != nil {
+			e.fail(ctx, "portfolio-increase-"+o.Symbol, err)
+		}
+		return
+	}
 	if len(e.state.Positions) >= e.cfg.Strategy.TargetPositions {
 		return
 	}
@@ -1249,6 +1283,138 @@ func (e *Engine) rebalance(ctx context.Context, now time.Time, markets map[strin
 	}
 }
 
+func depthHistoryStageRank(stage string) int {
+	switch stage {
+	case "quarter":
+		return 1
+	case "half":
+		return 2
+	case "full":
+		return 3
+	default:
+		return 0
+	}
+}
+
+func (e *Engine) increasePosition(ctx context.Context, p *Position, o Opportunity, reason string) error {
+	delta := o.TargetNotionalUSDT - p.SpotCostUSDT
+	if delta <= math.Max(.01, p.SpotCostUSDT*.01) {
+		return nil
+	}
+	if available := e.availableEntryNotional(); delta > available+1e-9 {
+		return fmt.Errorf("position increase requires %.2f USDT per leg but only %.2f USDT risk-adjusted capacity remains", delta, available)
+	}
+	t := e.tokens[o.Symbol]
+	quote, err := e.chain.BestQuote(ctx, t, delta, e.cfg.Risk.ReferenceQuoteUSDT)
+	if err != nil {
+		return err
+	}
+	if quote.BuyPriceImpactBPS > e.cfg.Risk.MaxEntryChainPriceImpactBPS || quote.SellPriceImpactBPS > e.cfg.Risk.MaxEntryChainPriceImpactBPS {
+		return fmt.Errorf("%s increase quote exceeds %.2f bps two-sided impact limit", o.Symbol, e.cfg.Risk.MaxEntryChainPriceImpactBPS)
+	}
+	if o.Market.MarkPrice <= 0 || quote.BuyPrice <= 0 || math.Abs(quote.BuyPrice/o.Market.MarkPrice-1)*10000 > e.cfg.Strategy.MaxEntryBasisBPS {
+		return fmt.Errorf("%s increase quote fails the entry basis limit", o.Symbol)
+	}
+	if e.cfg.Mode == "live" {
+		before, err := e.chain.Balance(ctx, t.BSCAddress, t.Decimals)
+		if err != nil {
+			return err
+		}
+		op, err := e.beginOperation("increase", o.Symbol, reason, t)
+		if err != nil {
+			return err
+		}
+		op.BalanceBefore = before
+		op.OriginalTokenQty = p.TokenQty
+		op.OriginalShortQty = p.ShortQty
+		op.OriginalSpotCostUSDT = p.SpotCostUSDT
+		op.OriginalShortEntryPrice = p.ShortEntryPrice
+		op.DepthHistoryStage = o.DepthHistory.Stage
+		op.TargetNotionalUSDT = delta
+		op.PlannedTokenQty = quote.OutputTokens
+		if err := e.updateOperation(op, "spot_submitting", nil); err != nil {
+			return err
+		}
+		recordBroadcast := func(hash common.Hash) error {
+			op.ChainTxHash = hash.Hex()
+			op.Stage = "spot_broadcast"
+			op.UpdatedAt = time.Now()
+			return saveState(e.cfg.StateDir, e.state)
+		}
+		_, tx, err := e.chain.SwapExactInputTracked(ctx, e.cfg.BSC.USDTAddress, t.BSCAddress, e.cfg.BSC.USDTDecimals, t.Decimals, delta, quote.OutputTokens, recordBroadcast)
+		if err != nil {
+			op.ChainTxHash = tx.Hex()
+			_ = e.updateOperation(op, "spot_status_unknown", err)
+			return err
+		}
+		op.ChainTxHash = tx.Hex()
+		if err := e.updateOperation(op, "spot_confirmed", nil); err != nil {
+			return err
+		}
+		after, err := e.chain.Balance(ctx, t.BSCAddress, t.Decimals)
+		if err != nil {
+			_ = e.updateOperation(op, "spot_balance_unknown", err)
+			return err
+		}
+		addedTokenQty := after - before
+		if addedTokenQty <= 0 {
+			err := fmt.Errorf("spot increase %s produced no token balance increase", tx)
+			_ = e.updateOperation(op, "spot_balance_unknown", err)
+			return err
+		}
+		op.BalanceAfter = after
+		op.PlannedTokenQty = addedTokenQty
+		if err := e.binance.ConfigureSymbol(ctx, o.Symbol); err != nil {
+			_ = e.updateOperation(op, "manual_reconciliation_required", err)
+			return err
+		}
+		rule := e.symbols[o.Symbol]
+		plannedShort := floorStep(addedTokenQty, rule.StepSize)
+		op.PlannedFuturesQty = plannedShort
+		if err := e.updateOperation(op, "futures_submitting", nil); err != nil {
+			return err
+		}
+		fill, err := e.submitTrackedMarketOrder(ctx, op, "futures-increase", "SELL", plannedShort, false)
+		if err != nil {
+			_ = e.updateOperation(op, "futures_status_unknown", err)
+			return fmt.Errorf("position increase hedge status is unknown; operation locked for reconciliation: %w", err)
+		}
+		if fill.ExecutedQty+rule.StepSize/2 < plannedShort {
+			_ = e.updateOperation(op, "manual_reconciliation_required", fmt.Errorf("Binance increase short partially filled %.8f of %.8f", fill.ExecutedQty, plannedShort))
+			return fmt.Errorf("%s increase has a partial futures hedge; operation locked for reconciliation", o.Symbol)
+		}
+		oldShortNotional := p.ShortQty * p.ShortEntryPrice
+		p.TokenQty += addedTokenQty
+		p.SpotCostUSDT += delta
+		p.ShortQty += fill.ExecutedQty
+		if p.ShortQty > 0 {
+			p.ShortEntryPrice = (oldShortNotional + fill.ExecutedQty*fill.AvgPrice) / p.ShortQty
+		}
+		p.LastAdjustedAt = time.Now()
+		p.DepthHistoryStage = o.DepthHistory.Stage
+		e.chainAvailableUSDT = math.Max(0, e.chainAvailableUSDT-delta)
+		e.accountRisk.AvailableBalance = math.Max(0, e.accountRisk.AvailableBalance-delta/math.Max(1, float64(e.cfg.Binance.Leverage)))
+		if err := e.finishOperation(op); err != nil {
+			return err
+		}
+		_ = appendLedger(e.cfg.StateDir, map[string]any{"time": p.LastAdjustedAt, "event": "increase", "mode": e.cfg.Mode, "symbol": p.Symbol, "reason": reason, "added_notional_usdt": delta, "total_notional_usdt": p.SpotCostUSDT, "depth_history_stage": o.DepthHistory.Stage, "depth_history_samples": o.DepthHistory.SampleCount, "depth_history_pass_ratio": o.DepthHistory.PassRatio})
+		_ = e.alert.Send(ctx, "increase-"+o.Symbol, "INFO", fmt.Sprintf("increased %s by %.2f USDT to %.2f USDT after depth history reached %s", o.Symbol, delta, p.SpotCostUSDT, o.DepthHistory.Stage))
+		return nil
+	}
+	oldShortNotional := p.ShortQty * p.ShortEntryPrice
+	p.TokenQty += quote.OutputTokens
+	p.SpotCostUSDT += delta
+	p.ShortQty += quote.OutputTokens
+	if p.ShortQty > 0 {
+		p.ShortEntryPrice = (oldShortNotional + quote.OutputTokens*o.Market.MarkPrice) / p.ShortQty
+	}
+	p.LastAdjustedAt = time.Now()
+	p.DepthHistoryStage = o.DepthHistory.Stage
+	_ = appendLedger(e.cfg.StateDir, map[string]any{"time": p.LastAdjustedAt, "event": "increase", "mode": e.cfg.Mode, "symbol": p.Symbol, "reason": reason, "added_notional_usdt": delta, "total_notional_usdt": p.SpotCostUSDT, "depth_history_stage": o.DepthHistory.Stage, "depth_history_samples": o.DepthHistory.SampleCount, "depth_history_pass_ratio": o.DepthHistory.PassRatio})
+	_ = e.alert.Send(ctx, "increase-"+o.Symbol, "INFO", fmt.Sprintf("increased %s by %.2f USDT to %.2f USDT after depth history reached %s", o.Symbol, delta, p.SpotCostUSDT, o.DepthHistory.Stage))
+	return nil
+}
+
 func (e *Engine) openPosition(ctx context.Context, o Opportunity, reason string) error {
 	t := e.tokens[o.Symbol]
 	qty := o.Chain.OutputTokens
@@ -1271,6 +1437,7 @@ func (e *Engine) openPosition(ctx context.Context, o Opportunity, reason string)
 		op.BalanceBefore = before
 		op.PlannedTokenQty = o.Chain.OutputTokens
 		op.TargetNotionalUSDT = o.TargetNotionalUSDT
+		op.DepthHistoryStage = o.DepthHistory.Stage
 		if err := e.updateOperation(op, "spot_submitting", nil); err != nil {
 			return err
 		}
@@ -1339,7 +1506,7 @@ func (e *Engine) openPosition(ctx context.Context, o Opportunity, reason string)
 		}
 	}
 	now := time.Now()
-	p := &Position{Symbol: o.Symbol, TokenAddress: t.BSCAddress, TokenDecimals: t.Decimals, TokenQty: qty, SpotCostUSDT: o.TargetNotionalUSDT, ShortQty: shortQtyState, ShortEntryPrice: shortPrice, OpenedAt: now, LastAdjustedAt: now, LastFundingTime: now}
+	p := &Position{Symbol: o.Symbol, TokenAddress: t.BSCAddress, TokenDecimals: t.Decimals, TokenQty: qty, SpotCostUSDT: o.TargetNotionalUSDT, ShortQty: shortQtyState, ShortEntryPrice: shortPrice, OpenedAt: now, LastAdjustedAt: now, LastFundingTime: now, DepthHistoryStage: o.DepthHistory.Stage}
 	e.state.Positions[o.Symbol] = p
 	e.setPositionDecision(o.Symbol, "继续持有并收取资金费")
 	if e.cfg.Mode == "live" {
@@ -1354,7 +1521,7 @@ func (e *Engine) openPosition(ctx context.Context, o Opportunity, reason string)
 		e.persist()
 	}
 	delete(e.state.EntryConfirmations, o.Symbol)
-	event := map[string]any{"time": now, "event": "open", "mode": e.cfg.Mode, "symbol": o.Symbol, "reason": reason, "notional_usdt": o.TargetNotionalUSDT, "token_qty": qty, "short_price": shortPrice, "funding_apr_percent": o.FundingAPRPercent, "estimated_round_trip_cost_usdt": o.RoundTripCostUSDT}
+	event := map[string]any{"time": now, "event": "open", "mode": e.cfg.Mode, "symbol": o.Symbol, "reason": reason, "notional_usdt": o.TargetNotionalUSDT, "full_target_notional_usdt": o.FullTargetNotionalUSDT, "token_qty": qty, "short_price": shortPrice, "funding_apr_percent": o.FundingAPRPercent, "estimated_round_trip_cost_usdt": o.RoundTripCostUSDT, "depth_history_stage": o.DepthHistory.Stage, "depth_history_samples": o.DepthHistory.SampleCount, "depth_history_pass_ratio": o.DepthHistory.PassRatio}
 	_ = appendLedger(e.cfg.StateDir, event)
 	if !operationComplete {
 		return fmt.Errorf("%s opened with a partial futures hedge; new risk is locked for reconciliation", o.Symbol)
@@ -1388,6 +1555,7 @@ func (e *Engine) closePosition(ctx context.Context, p *Position, market FundingM
 			p.SpotCostUSDT *= 1 - actualFraction
 			p.FundingAccruedUSDT *= 1 - actualFraction
 			p.LastAdjustedAt = time.Now()
+			p.DepthHistoryStage = ""
 			e.releaseEntryCapacity(exitUSDT, closedFuturesNotional)
 			_ = appendLedger(e.cfg.StateDir, map[string]any{"time": time.Now(), "event": "reduce", "mode": e.cfg.Mode, "symbol": p.Symbol, "fraction": actualFraction, "reason": reason + "_partial_fill", "pnl_usdt": pnl, "funding_usdt": funding, "fees_and_gas_estimate_usdt": fees})
 			return fmt.Errorf("Binance close partially filled %.2f%%; position retained with actual remaining quantities", actualFraction*100)
@@ -1457,6 +1625,7 @@ func (e *Engine) reducePosition(ctx context.Context, p *Position, fraction float
 	p.SpotCostUSDT *= 1 - fraction
 	p.FundingAccruedUSDT *= 1 - fraction
 	p.LastAdjustedAt = time.Now()
+	p.DepthHistoryStage = ""
 	e.releaseEntryCapacity(exitUSDT, closedFuturesNotional)
 	_ = appendLedger(e.cfg.StateDir, map[string]any{"time": time.Now(), "event": "reduce", "mode": e.cfg.Mode, "symbol": p.Symbol, "fraction": fraction, "reason": reason, "pnl_usdt": pnl, "funding_usdt": funding, "fees_and_gas_estimate_usdt": fees})
 	return nil

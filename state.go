@@ -16,7 +16,7 @@ func loadState(dir string) (*BotState, error) {
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		now := time.Now()
-		return &BotState{Version: currentStateVersion, StartedAt: now, UpdatedAt: now, Positions: map[string]*Position{}, FundingEWMA: map[string]float64{}, FundingSamples: map[string]int{}, WeakFundingScans: map[string]int{}, FundingHistory: map[string][]FundingRecord{}, FundingStats: map[string]FundingStats{}, WeakFundingSettlements: map[string]int{}, EntryConfirmations: map[string]int{}, CooldownUntil: map[string]time.Time{}, DepthBreachScans: map[string]int{}, LiquidationBreachScans: map[string]int{}, PendingOperations: map[string]*PendingOperation{}, DailyDate: now.Format("2006-01-02")}, nil
+		return &BotState{Version: currentStateVersion, StartedAt: now, UpdatedAt: now, Positions: map[string]*Position{}, FundingEWMA: map[string]float64{}, FundingSamples: map[string]int{}, WeakFundingScans: map[string]int{}, FundingHistory: map[string][]FundingRecord{}, FundingStats: map[string]FundingStats{}, DepthQuoteHistory: map[string][]DepthQuoteSample{}, WeakFundingSettlements: map[string]int{}, EntryConfirmations: map[string]int{}, CooldownUntil: map[string]time.Time{}, DepthBreachScans: map[string]int{}, LiquidationBreachScans: map[string]int{}, PendingOperations: map[string]*PendingOperation{}, DailyDate: now.Format("2006-01-02")}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -61,6 +61,9 @@ func loadState(dir string) (*BotState, error) {
 	}
 	if s.FundingStats == nil {
 		s.FundingStats = map[string]FundingStats{}
+	}
+	if s.DepthQuoteHistory == nil {
+		s.DepthQuoteHistory = map[string][]DepthQuoteSample{}
 	}
 	if s.WeakFundingSettlements == nil {
 		s.WeakFundingSettlements = map[string]int{}

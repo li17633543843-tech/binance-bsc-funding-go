@@ -13,6 +13,7 @@
 - 自动发现模式默认只监控每期资金费严格大于 `0.01%`（`1 bps`）的 Binance USDT 永续；先读取 OKX DEX 的 BSC 主流币目录，再通过 OKX 代币搜索补查目录外币种。只有 Binance 基础资产代码与 BSC 代币代码完全相同、且搜索结果只有一个合约地址时才视为匹配；同名多地址会跳过。所有 OKX 请求统一节流，遇到 HTTP 429 会退避重试。
 - Binance 返回 HTTP 429/418 时，程序会读取 `Retry-After` 或错误正文中的封禁截止时间，在本地冷却窗口内停止全部 Binance HTTP 请求；资金费历史补录按每 750ms 一个请求节流，避免结算时集中请求。
 - 链上深度和候选报价默认每 30 分钟刷新一次，每轮最多报价 40 个资金费候选；Binance 资金费行情仍按 `scan_seconds` 高频更新。深度不合格属于正常风控淘汰，不再记作系统故障。
+- 对达到预采样费率线（默认 1 bps/期）的潜在候选提前保存真实 `USDT→代币→USDT` 双向报价。信号达到正式开仓线时直接使用此前样本：连续 3 次合格只允许 25% 试探仓，12 组稳定样本允许 50%，24 组且覆盖至少 3 小时、合格率不低于 85% 才允许 100%。样本随 `state.json` 持久化，升级和重启不会清空；只有由该流程创建、且未因风控减仓的观察仓，才会随样本阶段从 25% 自动补到 50% 和 100%。
 - 程序启动时会按持仓中保存的合约地址恢复历史模拟/实盘仓位的代币配置，即使该币当前资金费已经低于新币筛选门槛，也不会向 OKX 发送空地址。
 - 新开仓继续要求目标仓位的多倍买入深度；已有仓位改用当前真实持仓的 `代币→USDT` 卖出方向逐级探测。默认只有连续 3 次卖出容量不足才减仓，且每次减仓量不会超过已经验证可执行的卖出分块。所有分块均超过冲击阈值时只暂停并告警，不会把“容量为 0”解释成盲目全平。
 - 实盘优先检查 Binance 爆仓距离。低于警戒线缓慢减仓，达到紧急线全部退出并告警。
@@ -142,6 +143,11 @@ $env:FUNDING_BOT_DASHBOARD_PASSWORD='请设置一个长随机密码'
 - `risk.max_futures_margin_use_percent`: 最多使用多少比例的 Binance 可用保证金计算新增名义仓位。
 - `risk.min_bsc_usdt_reserve`: BSC 钱包中不参与新开仓的 USDT 安全储备。
 - `min_current_funding_bps_per_interval`: 当前这一期资金费率最低值。
+- `depth_history_probe_min_funding_bps`: 开仓线以下开始预采集真实双向报价的费率线，默认 1 bps/期，不能高于正式开仓线。
+- `depth_history_window_hours` / `depth_history_max_samples`: 每个币保留的滚动双向报价时间窗口和最多样本数，默认 24 小时/48 条。
+- `depth_history_half_samples` / `depth_history_full_samples`: 允许半仓和满仓的最低样本数，默认 12/24 条。
+- `depth_history_min_span_minutes` / `depth_history_min_pass_ratio`: 满仓样本至少覆盖 180 分钟，双向冲击合格率至少 85%。
+- `depth_history_cold_start_confirmations`: 冷启动连续合格多少次后允许 25% 试探仓，默认 3 次。
 - `min_funding_apr_percent`: 历史资金费 EWMA 的最低年化值。机器人会读取 Binance 调整过的结算周期，未返回时才使用 `funding_intervals_per_year`。
 - `evaluation_hold_hours`: 用多长持有期估算收益能否覆盖完整往返磨损。
 - `min_switch_apr_advantage_percent`: 新币相对旧币必须多出的年化收益。

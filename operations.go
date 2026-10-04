@@ -305,8 +305,93 @@ func (e *Engine) recoverPendingOperations(ctx context.Context) error {
 				return fmt.Errorf("recover open %s hedge drift: spot %.8f short %.8f", op.Symbol, qty, shortQty)
 			}
 			now := time.Now()
-			e.state.Positions[op.Symbol] = &Position{Symbol: op.Symbol, TokenAddress: op.TokenAddress, TokenDecimals: op.TokenDecimals, TokenQty: qty, SpotCostUSDT: op.TargetNotionalUSDT, ShortQty: shortQty, ShortEntryPrice: shortPrice, OpenedAt: op.CreatedAt, LastAdjustedAt: now, LastFundingTime: now}
+			e.state.Positions[op.Symbol] = &Position{Symbol: op.Symbol, TokenAddress: op.TokenAddress, TokenDecimals: op.TokenDecimals, TokenQty: qty, SpotCostUSDT: op.TargetNotionalUSDT, ShortQty: shortQty, ShortEntryPrice: shortPrice, OpenedAt: op.CreatedAt, LastAdjustedAt: now, LastFundingTime: now, DepthHistoryStage: op.DepthHistoryStage}
 			_ = appendLedger(e.cfg.StateDir, map[string]any{"time": now, "event": "operation_recovered", "kind": "open", "symbol": op.Symbol, "chain_tx_hash": op.ChainTxHash})
+			if err := e.finishOperation(op); err != nil {
+				return err
+			}
+		case "increase":
+			p := e.state.Positions[op.Symbol]
+			if p == nil {
+				return fmt.Errorf("recover increase %s: saved position is missing", op.Symbol)
+			}
+			risks, err := e.binance.PositionRisks(ctx)
+			if err != nil {
+				return err
+			}
+			actualTotalShort := 0.0
+			actualEntryPrice := 0.0
+			if risk, ok := risks[op.Symbol]; ok && risk.PositionAmount < 0 {
+				actualTotalShort = math.Abs(risk.PositionAmount)
+				actualEntryPrice = risk.EntryPrice
+				if actualEntryPrice <= 0 {
+					actualEntryPrice = risk.MarkPrice
+				}
+			}
+			if txStatus == "reverted" {
+				if actualTotalShort > op.OriginalShortQty+1e-12 {
+					return fmt.Errorf("recover reverted increase %s: Binance short grew to %.8f", op.Symbol, actualTotalShort)
+				}
+				if err := e.finishOperation(op); err != nil {
+					return err
+				}
+				continue
+			}
+			balance, err := e.chain.Balance(ctx, token.BSCAddress, token.Decimals)
+			if err != nil {
+				return fmt.Errorf("recover increase %s balance: %w", op.Symbol, err)
+			}
+			addedToken := balance - op.BalanceBefore
+			if addedToken <= 0 {
+				if op.ChainTxHash == "" {
+					if err := e.finishOperation(op); err != nil {
+						return err
+					}
+					continue
+				}
+				return fmt.Errorf("recover increase %s: confirmed chain transaction produced no balance increase", op.Symbol)
+			}
+			addedShort := math.Max(0, actualTotalShort-op.OriginalShortQty)
+			addedShortPrice := actualEntryPrice
+			if addedShort <= 0 && op.BinanceClientOrderID != "" {
+				fill, queryErr := e.binance.OrderByClientID(ctx, op.Symbol, op.BinanceClientOrderID)
+				if queryErr != nil {
+					return fmt.Errorf("recover increase %s Binance order %s status is unknown: %w", op.Symbol, op.BinanceClientOrderID, queryErr)
+				}
+				addedShort, addedShortPrice = fill.ExecutedQty, fill.AvgPrice
+			}
+			if addedShort <= 0 {
+				if err := e.binance.ConfigureSymbol(ctx, op.Symbol); err != nil {
+					return fmt.Errorf("recover increase %s configure: %w", op.Symbol, err)
+				}
+				rule, ok := e.symbols[op.Symbol]
+				if !ok {
+					return fmt.Errorf("recover increase %s symbol rule missing", op.Symbol)
+				}
+				planned := floorStep(addedToken, rule.StepSize)
+				fill, err := e.submitTrackedMarketOrder(ctx, op, "futures-increase-recovery", "SELL", planned, false)
+				if err != nil {
+					return fmt.Errorf("recover increase %s hedge: %w", op.Symbol, err)
+				}
+				addedShort, addedShortPrice = fill.ExecutedQty, fill.AvgPrice
+			}
+			totalToken := op.OriginalTokenQty + addedToken
+			totalShort := op.OriginalShortQty + addedShort
+			driftDenom := math.Max(totalToken, totalShort)
+			if driftDenom <= 0 || math.Abs(totalToken-totalShort)/driftDenom*100 > e.cfg.Risk.MaxHedgeDriftPercent {
+				return fmt.Errorf("recover increase %s hedge drift: spot %.8f short %.8f", op.Symbol, totalToken, totalShort)
+			}
+			p.TokenQty = totalToken
+			p.ShortQty = totalShort
+			p.SpotCostUSDT = op.OriginalSpotCostUSDT + op.TargetNotionalUSDT
+			if actualEntryPrice > 0 {
+				p.ShortEntryPrice = actualEntryPrice
+			} else if totalShort > 0 {
+				p.ShortEntryPrice = (op.OriginalShortQty*op.OriginalShortEntryPrice + addedShort*addedShortPrice) / totalShort
+			}
+			p.LastAdjustedAt = time.Now()
+			p.DepthHistoryStage = op.DepthHistoryStage
+			_ = appendLedger(e.cfg.StateDir, map[string]any{"time": p.LastAdjustedAt, "event": "operation_recovered", "kind": "increase", "symbol": op.Symbol, "chain_tx_hash": op.ChainTxHash})
 			if err := e.finishOperation(op); err != nil {
 				return err
 			}
@@ -365,6 +450,7 @@ func (e *Engine) recoverPendingOperations(ctx context.Context) error {
 				p.SpotCostUSDT *= tokenFraction
 				p.FundingAccruedUSDT *= tokenFraction
 				p.LastAdjustedAt = time.Now()
+				p.DepthHistoryStage = ""
 				if p.TokenQty <= 0 && p.ShortQty <= 0 {
 					delete(e.state.Positions, op.Symbol)
 				}
