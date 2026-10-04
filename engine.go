@@ -523,17 +523,41 @@ func (e *Engine) runCycle(ctx context.Context) {
 		e.mu.Unlock()
 		return
 	}
+	// Discovery and a cold funding-history refresh can take much longer than
+	// MaxDataAgeSeconds. Refresh the bulk Binance snapshot before any strategy
+	// decision so a slow warm-up cannot make every otherwise eligible token look
+	// stale by the time the chain scan starts.
+	now = time.Now()
+	if marketSnapshotStale(markets, now, e.cfg.Risk.MaxDataAgeSeconds) {
+		refreshed, refreshErr := e.binance.Markets(ctx)
+		if refreshErr != nil {
+			e.fail(ctx, "markets-refresh", refreshErr)
+			e.persist()
+			return
+		}
+		markets = refreshed
+		e.updateFundingWatch(markets)
+		now = time.Now()
+		slog.Info("refreshed stale Binance market snapshot after slow preprocessing", "markets", len(markets))
+	}
 	e.manageExisting(ctx, now, markets)
 	if !now.Before(e.nextChainScan) {
 		e.manageDepthSpreadAndHedge(ctx, now, markets)
-		opps, scanErr := e.scanOpportunities(ctx, markets)
+		opps, quoteAttempts, scanErr := e.scanOpportunities(ctx, markets)
 		if scanErr != nil {
 			slog.Warn("candidate scan partially failed", "error", scanErr)
 		}
-		// Partial quote failures must not turn into a five-minute retry storm.
-		// Keep the configured low-frequency cadence so a transient OKX limit or
-		// one illiquid token cannot amplify into global 429 responses.
-		e.nextChainScan = time.Now().Add(time.Duration(e.cfg.Strategy.ChainQuoteRefreshMinutes) * time.Minute)
+		if quoteAttempts == 0 && len(e.state.Positions) == 0 {
+			// No OKX quote was requested, so there is no rate-limit reason to apply
+			// the long chain cooldown. Retry on the next normal engine tick.
+			e.nextChainScan = time.Now().Add(time.Duration(e.cfg.ScanSeconds) * time.Second)
+			slog.Debug("chain scan made no quote attempts; retrying on next cycle")
+		} else {
+			// Partial quote failures must not turn into a retry storm. Once any
+			// chain work was attempted, keep the configured low-frequency cadence
+			// so a transient OKX limit cannot amplify into global 429 responses.
+			e.nextChainScan = time.Now().Add(time.Duration(e.cfg.Strategy.ChainQuoteRefreshMinutes) * time.Minute)
+		}
 		ranked := rankOpportunities(opps)
 		if scanErr == nil && len(e.state.PendingOperations) == 0 {
 			e.manageSpreadProfitRotations(ctx, now, markets, ranked)
@@ -560,6 +584,22 @@ func (e *Engine) runCycle(ctx context.Context) {
 	}
 	e.refreshHealthLocked(markets)
 	e.mu.Unlock()
+}
+
+func marketSnapshotStale(markets map[string]FundingMarket, now time.Time, maxAgeSeconds int) bool {
+	if len(markets) == 0 {
+		return true
+	}
+	newest := time.Time{}
+	for _, market := range markets {
+		if market.UpdatedAt.After(newest) {
+			newest = market.UpdatedAt
+		}
+	}
+	if newest.IsZero() {
+		return true
+	}
+	return now.Sub(newest) > time.Duration(maxAgeSeconds)*time.Second
 }
 
 func (e *Engine) refreshTradingMetadata(ctx context.Context) error {
@@ -1055,7 +1095,7 @@ func (e *Engine) accrueFunding(p *Position, m FundingMarket, now time.Time) {
 	}
 }
 
-func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]FundingMarket) ([]Opportunity, error) {
+func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]FundingMarket) ([]Opportunity, int, error) {
 	now := time.Now()
 	type candidate struct {
 		token  TokenConfig
@@ -1175,7 +1215,7 @@ func (e *Engine) scanOpportunities(ctx context.Context, markets map[string]Fundi
 			out = append(out, r.o)
 		}
 	}
-	return out, first
+	return out, len(candidates), first
 }
 
 func (e *Engine) intervalsPerYear(symbol string) float64 {

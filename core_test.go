@@ -175,6 +175,21 @@ func TestRecordDepthQuoteKeepsOnlyRecentBoundedSamples(t *testing.T) {
 
 type depthHistoryTestChain struct{ operationTestChain }
 
+type staleThenFreshMarketsBinance struct {
+	*operationTestBinance
+	calls     int
+	stale     map[string]FundingMarket
+	refreshed map[string]FundingMarket
+}
+
+func (b *staleThenFreshMarketsBinance) Markets(context.Context) (map[string]FundingMarket, error) {
+	b.calls++
+	if b.calls == 1 {
+		return b.stale, nil
+	}
+	return b.refreshed, nil
+}
+
 func (c *depthHistoryTestChain) DepthCapacity(_ context.Context, t TokenConfig, _ Config) (float64, ChainQuote, error) {
 	return 900, ChainQuote{Symbol: t.Symbol, InputUSDT: 900, OutputTokens: 90, BuyPrice: 10, SellPrice: 9.99, RoundTripLossBPS: 10, BuyPriceImpactBPS: 10, SellPriceImpactBPS: 12}, nil
 }
@@ -225,12 +240,119 @@ func TestCandidateScanUsesSavedQuotesForImmediateQuarterEntry(t *testing.T) {
 		tokens:       map[string]TokenConfig{"CAKEUSDT": {Symbol: "CAKE", BinanceSymbol: "CAKEUSDT", MaxNotionalUSDT: 500}},
 		fundingHours: map[string]float64{"CAKEUSDT": 8},
 	}
-	opps, err := e.scanOpportunities(context.Background(), map[string]FundingMarket{"CAKEUSDT": {Symbol: "CAKEUSDT", MarkPrice: 10, IndexPrice: 10, FundingRate: .0006, UpdatedAt: now}})
+	opps, attempts, err := e.scanOpportunities(context.Background(), map[string]FundingMarket{"CAKEUSDT": {Symbol: "CAKEUSDT", MarkPrice: 10, IndexPrice: 10, FundingRate: .0006, UpdatedAt: now}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if attempts != 1 {
+		t.Fatalf("depth quote attempts = %d, want 1", attempts)
+	}
 	if len(opps) != 1 || math.Abs(opps[0].TargetNotionalUSDT-75) > 1e-9 || opps[0].DepthHistory.Stage != "quarter" || len(e.state.DepthQuoteHistory["CAKEUSDT"]) != 3 {
 		t.Fatalf("saved depth history did not produce the staged opportunity: %+v history=%+v", opps, e.state.DepthQuoteHistory["CAKEUSDT"])
+	}
+}
+
+func TestCycleRefreshesStaleMarketsBeforeDepthSampling(t *testing.T) {
+	now := time.Now()
+	nextFunding := now.Add(8 * time.Hour)
+	staleMarket := FundingMarket{Symbol: "CAKEUSDT", MarkPrice: 10, IndexPrice: 10, FundingRate: .0006, NextFundingTime: nextFunding, UpdatedAt: now.Add(-10 * time.Minute)}
+	freshMarket := staleMarket
+	freshMarket.UpdatedAt = now
+	b := &staleThenFreshMarketsBinance{
+		operationTestBinance: &operationTestBinance{},
+		stale:                map[string]FundingMarket{"CAKEUSDT": staleMarket},
+		refreshed:            map[string]FundingMarket{"CAKEUSDT": freshMarket},
+	}
+	history := []FundingRecord{
+		{Time: now.Add(-24 * time.Hour), Rate: .0003, MarkPrice: 10},
+		{Time: now.Add(-16 * time.Hour), Rate: .0003, MarkPrice: 10},
+		{Time: now.Add(-8 * time.Hour), Rate: .0003, MarkPrice: 10},
+	}
+	e := &Engine{
+		cfg: Config{
+			Mode:        "paper",
+			ScanSeconds: 60,
+			StateDir:    t.TempDir(),
+			Binance:     BinanceConfig{TakerFeeBPS: 1},
+			BSC:         BSCConfig{GasReserveUSDT: .1},
+			Strategy: StrategyConfig{
+				MaxQuoteCandidates:                 40,
+				ChainQuoteRefreshMinutes:           30,
+				MinCurrentFundingBPS:               5,
+				DepthHistoryProbeMinBPS:            1,
+				MinFundingAPRPercent:               20,
+				FundingIntervalsPerYear:            1095,
+				FundingEWMAAlpha:                   .15,
+				FundingHistoryDays:                 30,
+				MinFundingHistorySamples:           3,
+				MinPositiveFundingRatio:            .7,
+				MaxCurrentToMedianRatio:            3,
+				EvaluationHoldHours:                720,
+				MaxEntryPaybackDays:                30,
+				MaxEntryBasisBPS:                   100,
+				MinCostCoverageRatio:               1,
+				DepthHistoryWindowHours:            24,
+				DepthHistoryMaxSamples:             48,
+				DepthHistoryHalfSamples:            12,
+				DepthHistoryFullSamples:            24,
+				DepthHistoryMinSpanMinutes:         180,
+				DepthHistoryMinPassRatio:           .85,
+				DepthHistoryColdStartConfirmations: 3,
+			},
+			Risk: RiskConfig{TotalCapitalUSDT: 10000, TargetNotionalPerCoinUSDT: 300, MaxNotionalPerCoinUSDT: 500, MaxCapitalPerCoinPercent: 5, DepthSafetyMultiplier: 3, MaxEntryChainPriceImpactBPS: 20, MaxChainPriceImpactBPS: 35, ReferenceQuoteUSDT: 10, MaxDataAgeSeconds: 120},
+		},
+		binance:             b,
+		chain:               &depthHistoryTestChain{},
+		alert:               NewAlerter(AlertConfig{}),
+		state:               &BotState{Version: currentStateVersion, StartedAt: now, Positions: map[string]*Position{}, FundingHistory: map[string][]FundingRecord{"CAKEUSDT": history}, FundingStats: map[string]FundingStats{"CAKEUSDT": {ObservedNextFundingTime: nextFunding}}, FundingSamples: map[string]int{}, FundingEWMA: map[string]float64{}, DepthQuoteHistory: map[string][]DepthQuoteSample{}, EntryConfirmations: map[string]int{}, CooldownUntil: map[string]time.Time{}, DepthBreachScans: map[string]int{}, LiquidationBreachScans: map[string]int{}, PendingOperations: map[string]*PendingOperation{}},
+		symbols:             map[string]BinanceSymbol{"CAKEUSDT": {Symbol: "CAKEUSDT", Base: "CAKE", StepSize: .001, MinQty: .001}},
+		tokens:              map[string]TokenConfig{"CAKEUSDT": {Symbol: "CAKE", BinanceSymbol: "CAKEUSDT", MaxNotionalUSDT: 500}},
+		fundingHours:        map[string]float64{"CAKEUSDT": 8},
+		nextMetadataRefresh: now.Add(time.Hour),
+		positionDecisions:   map[string]string{},
+	}
+
+	e.runCycle(context.Background())
+
+	if b.calls != 2 {
+		t.Fatalf("market snapshots requested %d times, want stale snapshot followed by one refresh", b.calls)
+	}
+	if got := len(e.state.DepthQuoteHistory["CAKEUSDT"]); got != 1 {
+		t.Fatalf("depth samples after stale snapshot refresh = %d, want 1", got)
+	}
+}
+
+func TestCycleRetriesNextTickWhenNoDepthQuoteWasAttempted(t *testing.T) {
+	now := time.Now()
+	market := FundingMarket{Symbol: "OTHERUSDT", MarkPrice: 1, IndexPrice: 1, UpdatedAt: now}
+	b := &staleThenFreshMarketsBinance{
+		operationTestBinance: &operationTestBinance{},
+		stale:                map[string]FundingMarket{"OTHERUSDT": market},
+		refreshed:            map[string]FundingMarket{"OTHERUSDT": market},
+	}
+	e := &Engine{
+		cfg: Config{
+			Mode:        "paper",
+			ScanSeconds: 60,
+			StateDir:    t.TempDir(),
+			Strategy:    StrategyConfig{ChainQuoteRefreshMinutes: 30, DepthHistoryProbeMinBPS: 1},
+			Risk:        RiskConfig{MaxDataAgeSeconds: 120},
+		},
+		binance:             b,
+		chain:               &depthHistoryTestChain{},
+		alert:               NewAlerter(AlertConfig{}),
+		state:               &BotState{Version: currentStateVersion, StartedAt: now, Positions: map[string]*Position{}, FundingHistory: map[string][]FundingRecord{}, FundingStats: map[string]FundingStats{}, FundingSamples: map[string]int{}, FundingEWMA: map[string]float64{}, DepthQuoteHistory: map[string][]DepthQuoteSample{}, EntryConfirmations: map[string]int{}, CooldownUntil: map[string]time.Time{}, DepthBreachScans: map[string]int{}, LiquidationBreachScans: map[string]int{}, PendingOperations: map[string]*PendingOperation{}},
+		symbols:             map[string]BinanceSymbol{},
+		tokens:              map[string]TokenConfig{},
+		fundingHours:        map[string]float64{},
+		nextMetadataRefresh: now.Add(time.Hour),
+		positionDecisions:   map[string]string{},
+	}
+
+	e.runCycle(context.Background())
+
+	if delay := time.Until(e.nextChainScan); delay > 2*time.Minute {
+		t.Fatalf("empty depth scan delayed the next attempt by %s, want retry on the next normal cycle", delay)
 	}
 }
 
