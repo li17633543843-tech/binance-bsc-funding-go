@@ -76,6 +76,22 @@
 
 确认长期稳定后，把 `mode` 改为 `paper`。模拟模式不需要 Binance API Key 或 BSC 私钥。当前本机 `config.json` 已切换为 `paper`；程序会用真实行情模拟开仓、减仓和平仓，并把结果写入页面的“模拟订单”标签。
 
+### 手动测试单笔模拟平仓
+
+在 `paper` 模式且已有持仓时，新版程序可单独运行 `-paper-close-test TACUSDT`。它读取最近保存的仓位，获取当前 Binance 行情和 OKX DEX 可执行卖出报价，在 `state_dir/paper-close-test-*` 中复制状态并运行一次模拟平仓，生成 `result.json` 和独立的 `ledger.jsonl`。原本的 `state.json`、订单流水和持续运行的服务不会改变；不会提交 Binance 订单或链上交易。状态或行情过期、存在未完成操作、报价失败时会拒绝测试。这只是当前报价下的估算，不是实际成交收益。
+
+服务器上可使用服务相同的运行用户和环境文件执行（先确认已安装包含此参数的新版程序）：
+
+```bash
+sudo systemd-run --wait --collect --pipe \
+  -p User=fundingbot \
+  -p EnvironmentFile=/etc/binance-bsc-funding.env \
+  /opt/binance-bsc-funding/binance-bsc-funding \
+  -config /etc/binance-bsc-funding.json -paper-close-test TACUSDT
+```
+
+把 `TACUSDT` 换成当前模拟持仓的合约代码。该命令仅测试仓位副本；若要清理测试结果，先记下输出里的 `test_dir`，核对目录确为 `paper-close-test-*` 后再处理，不要删除主 `state_dir`。
+
 ## 手机查看仪表盘
 
 仪表盘展示运行健康、全部正费率合约、BSC 匹配状态、套利候选、当前持仓和最近 200 条模拟/实盘订单流水。“参数设置”页可以修改策略、仓位、费率、深度、换仓和全仓风控参数。策略与风控参数在下一轮扫描边界生效；扫描间隔、杠杆、成本、代币发现和页面刷新参数保存后需要重启。

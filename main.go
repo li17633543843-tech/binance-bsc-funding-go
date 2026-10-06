@@ -20,6 +20,7 @@ func main() {
 	configPath := flag.String("config", "config.json", "configuration file")
 	check := flag.Bool("check", false, "validate configuration and exit")
 	probe := flag.String("probe", "", "quote one configured Binance symbol and exit")
+	paperCloseTest := flag.String("paper-close-test", "", "simulate closing one saved paper position in an isolated state directory")
 	flag.Parse()
 	cfg, err := loadEffectiveConfig(*configPath)
 	if err != nil {
@@ -31,6 +32,27 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *paperCloseTest != "" {
+		if *probe != "" {
+			fatal(errors.New("-paper-close-test and -probe cannot be used together"))
+		}
+		if cfg.Mode != "paper" {
+			fatal(errors.New("-paper-close-test requires paper mode"))
+		}
+		chain, err := NewOKXDEXClient(ctx, cfg.BSC, cfg.OKXDEX, "")
+		if err != nil {
+			fatal(err)
+		}
+		defer chain.Close()
+		result, err := runPaperCloseTest(ctx, cfg, *paperCloseTest, NewBinanceClient(cfg.Binance), chain)
+		if err != nil {
+			fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			fatal(err)
+		}
+		return
+	}
 	engine, err := newEngineWithRateLimitWait(ctx, cfg)
 	if err != nil {
 		fatal(err)
